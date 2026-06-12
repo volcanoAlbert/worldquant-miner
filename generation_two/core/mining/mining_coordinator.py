@@ -9,6 +9,7 @@ import threading
 from typing import List, Dict, Optional, Tuple, Callable
 from ..simulation_counter import SimulationCounter
 from ..slot_manager import SlotManager
+from ..simulator_tester import MAX_CONCURRENT_SIMULATIONS
 from .correlation_tracker import CorrelationTracker
 from .duplicate_detector import MiningDuplicateDetector
 from .search_strategy import SearchStrategyManager, SearchStrategy
@@ -49,7 +50,7 @@ class MiningCoordinator:
         
         # Initialize components
         self.sim_counter = SimulationCounter()
-        self.slot_manager = SlotManager(max_slots=8)
+        self.slot_manager = SlotManager(max_slots=MAX_CONCURRENT_SIMULATIONS)
         self.correlation_tracker = CorrelationTracker(db_path)
         self.duplicate_detector = MiningDuplicateDetector(db_path)
         self.search_strategy = SearchStrategyManager(search_strategy)

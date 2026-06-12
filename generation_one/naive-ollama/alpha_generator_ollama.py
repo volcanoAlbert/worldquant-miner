@@ -2,9 +2,11 @@ import argparse
 import requests
 import json
 import os
+from dataclasses import dataclass
+from pathlib import Path
 from time import sleep
 from requests.auth import HTTPBasicAuth
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 import time
 import re
 import logging
@@ -15,6 +17,131 @@ import random
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
+
+
+@dataclass
+class RemoteLLMConfig:
+    """OpenAI-compatible remote LLM configuration."""
+    base_url: str
+    api_key: str
+    model: str
+    timeout: int = 360
+
+
+def _strip_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _resolve_credentials_path(credentials_path: str) -> str:
+    """Find credential.txt/credentials.txt from cwd or parent folders."""
+    requested = Path(credentials_path).expanduser()
+    if requested.exists() or requested.is_absolute():
+        return str(requested)
+
+    names = [requested.name, "credential.txt", "credentials.txt"]
+    search_roots = [Path.cwd(), Path(__file__).resolve().parent]
+    seen = set()
+
+    for root in search_roots:
+        for parent in [root, *root.parents]:
+            parent_key = str(parent)
+            if parent_key in seen:
+                continue
+            seen.add(parent_key)
+            for name in names:
+                candidate = parent / name
+                if candidate.exists():
+                    return str(candidate)
+
+    return str(requested)
+
+
+def _parse_credentials_file(credentials_path: str) -> Tuple[List[str], Dict[str, str], str]:
+    """Parse WorldQuant credentials plus optional key=value LLM settings."""
+    resolved_path = _resolve_credentials_path(credentials_path)
+    with open(resolved_path) as f:
+        text = f.read()
+
+    settings: Dict[str, str] = {}
+    worldquant_credentials: Optional[List[str]] = None
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list) and len(parsed) >= 2:
+            worldquant_credentials = [parsed[0], parsed[1]]
+        elif isinstance(parsed, dict):
+            username = parsed.get("username") or parsed.get("email")
+            password = parsed.get("password")
+            if username and password:
+                worldquant_credentials = [username, password]
+            settings = {
+                str(key): str(value)
+                for key, value in parsed.items()
+                if value is not None
+            }
+    except json.JSONDecodeError:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if worldquant_credentials is None and line.startswith("["):
+                parsed_line = json.loads(line)
+                if isinstance(parsed_line, list) and len(parsed_line) >= 2:
+                    worldquant_credentials = [parsed_line[0], parsed_line[1]]
+                continue
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                settings[key.strip()] = _strip_quotes(value)
+
+    if not worldquant_credentials:
+        raise ValueError(
+            f"Could not find WorldQuant credentials in {resolved_path}. "
+            "Expected a JSON array like [\"email\", \"password\"]."
+        )
+
+    return worldquant_credentials, settings, resolved_path
+
+
+def _setting(settings: Dict[str, str], *names: str) -> Optional[str]:
+    normalized = {key.upper(): value for key, value in settings.items()}
+    for name in names:
+        value = settings.get(name)
+        if value:
+            return value
+
+        value = normalized.get(name.upper())
+        if value:
+            return value
+
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
+def _default_remote_model(base_url: str) -> str:
+    base_url_lower = base_url.lower()
+    if "deepseek" in base_url_lower:
+        return "deepseek-chat"
+    if "moonshot" in base_url_lower or "kimi" in base_url_lower:
+        return "moonshot-v1-8k"
+    if "openrouter" in base_url_lower:
+        return "openai/gpt-4o-mini"
+    return DEFAULT_REMOTE_MODEL
+
+
+def _chat_completions_url(base_url: str) -> str:
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return f"{base_url}/chat/completions"
 
 class RetryQueue:
     def __init__(self, generator, max_retries=3, retry_delay=60):
@@ -53,11 +180,20 @@ class RetryQueue:
             time.sleep(1)  # Prevent busy waiting
 
 class AlphaGenerator:
-    def __init__(self, credentials_path: str, ollama_url: str = "http://localhost:11434", max_concurrent: int = 2):
+    def __init__(
+        self,
+        credentials_path: str,
+        ollama_url: str = "http://localhost:11434",
+        max_concurrent: int = 2,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+        llm_model: Optional[str] = None,
+    ):
         self.sess = requests.Session()
         self.credentials_path = credentials_path  # Store path for reauth
         self.setup_auth(credentials_path)
         self.ollama_url = ollama_url
+        self.remote_llm = self._load_remote_llm_config(llm_base_url, llm_api_key, llm_model)
         self.results = []
         self.pending_results = {}
         self.retry_queue = RetryQueue(self)
@@ -79,14 +215,58 @@ class AlphaGenerator:
         ]
         self.current_model_index = 0
         
+    def _load_remote_llm_config(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Optional[RemoteLLMConfig]:
+        _, settings, resolved_path = _parse_credentials_file(self.credentials_path)
+
+        base_url = (
+            base_url
+            or _setting(settings, "base_url", "OPENAI_BASE_URL", "LLM_BASE_URL")
+        )
+        api_key = (
+            api_key
+            or _setting(settings, "OPENAI_API_KEY", "LLM_API_KEY", "API_KEY")
+        )
+
+        if not base_url or not api_key:
+            logging.info("Remote LLM config not found; using Ollama at %s", self.ollama_url)
+            return None
+
+        model = (
+            model
+            or _setting(settings, "OPENAI_MODEL", "LLM_MODEL", "MODEL")
+            or _default_remote_model(base_url)
+        )
+        timeout_raw = _setting(settings, "OPENAI_TIMEOUT", "LLM_TIMEOUT")
+        timeout = 360
+        if timeout_raw:
+            try:
+                timeout = int(timeout_raw)
+            except ValueError:
+                logging.warning("Invalid LLM timeout %r; using default %s", timeout_raw, timeout)
+
+        logging.info("Using remote OpenAI-compatible LLM endpoint from %s", resolved_path)
+        logging.info("Remote LLM base URL: %s", base_url)
+        logging.info("Remote LLM model: %s", model)
+        return RemoteLLMConfig(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+        )
+
     def setup_auth(self, credentials_path: str) -> None:
         """Set up authentication with WorldQuant Brain."""
         logging.info(f"Loading credentials from {credentials_path}")
-        with open(credentials_path) as f:
-            credentials = json.load(f)
+        credentials, _, resolved_path = _parse_credentials_file(credentials_path)
         
         username, password = credentials
         self.sess.auth = HTTPBasicAuth(username, password)
+        self.credentials_path = resolved_path
         
         logging.info("Authenticating with WorldQuant Brain...")
         response = self.sess.post('https://api.worldquantbrain.com/authentication')
@@ -210,8 +390,107 @@ class AlphaGenerator:
         
         return cleaned_ideas
 
+    def _extract_alpha_ideas(self, content: str) -> List[str]:
+        alpha_ideas = []
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('*'):
+                continue
+            # Remove numbering and backticks
+            line = line.replace('`', '')
+            if '. ' in line:
+                line = line.split('. ', 1)[1]
+            if line and not line.startswith('Comment:'):
+                alpha_ideas.append(line)
+        return alpha_ideas
+
+    def _call_remote_llm(self, prompt: str) -> str:
+        if not self.remote_llm:
+            raise RuntimeError("Remote LLM config is not loaded")
+
+        payload = {
+            "model": self.remote_llm.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You generate valid WorldQuant Brain alpha expressions. Return only expressions, one per line.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_tokens": 1000,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.remote_llm.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        response = requests.post(
+            _chat_completions_url(self.remote_llm.base_url),
+            headers=headers,
+            json=payload,
+            timeout=self.remote_llm.timeout,
+        )
+        logging.info("Remote LLM response status: %s", response.status_code)
+        if response.status_code >= 500:
+            self._handle_ollama_error(f"remote_{response.status_code}_error")
+            return ""
+        if response.status_code != 200:
+            raise Exception(f"Remote LLM request failed: {response.text[:1000]}")
+
+        response_data = response.json()
+        choices = response_data.get("choices", [])
+        if not choices:
+            raise Exception(f"Unexpected remote LLM response format: {response_data}")
+
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        if content is None:
+            content = choices[0].get("text")
+        if not content:
+            raise Exception(f"Remote LLM response did not include content: {response_data}")
+        return content
+
+    def _call_ollama(self, prompt: str) -> str:
+        model_name = getattr(self, 'model_name', self.model_fleet[self.current_model_index])
+        ollama_data = {
+            'model': model_name,
+            'prompt': prompt,
+            'stream': False,
+            'temperature': 0.3,
+            'top_p': 0.9,
+            'num_predict': 1000  # Use num_predict instead of max_tokens for Ollama
+        }
+
+        response = requests.post(
+            f'{self.ollama_url}/api/generate',
+            json=ollama_data,
+            timeout=360  # 6 minutes timeout
+        )
+
+        print(f"Ollama API response status: {response.status_code}")
+        print(f"Ollama API response: {response.text[:500]}...")  # Print first 500 chars
+
+        if response.status_code == 500:
+            logging.error(f"Ollama API returned 500 error: {response.text}")
+            # Trigger model downgrade for 500 errors
+            self._handle_ollama_error("500_error")
+            return ""
+        elif response.status_code != 200:
+            raise Exception(f"Ollama API request failed: {response.text}")
+
+        response_data = response.json()
+        print(f"Ollama API response JSON keys: {list(response_data.keys())}")
+
+        if 'response' not in response_data:
+            raise Exception(f"Unexpected Ollama API response format: {response_data}")
+
+        return response_data['response']
+
     def generate_alpha_ideas_with_ollama(self, data_fields: List[Dict], operators: List[Dict]) -> List[str]:
-        """Generate alpha ideas using Ollama with FinGPT model."""
+        """Generate alpha ideas using the configured LLM provider."""
         print("Organizing operators by category...")
         operator_by_category = {}
         for op in operators:
@@ -291,74 +570,33 @@ rank(divide(revenue, assets))
 market_ret = ts_product(1+group_mean(returns,1,market),250)-1;rfr = vec_avg(fnd6_newqeventv110_optrfrq);expected_return = rfr+beta_last_360_days_spy*(market_ret-rfr);actual_return = ts_product(returns+1,250)-1;actual_return-expected_return
 """
 
-            # Prepare Ollama API request
-            model_name = getattr(self, 'model_name', self.model_fleet[self.current_model_index])
-            ollama_data = {
-                'model': model_name,
-                'prompt': prompt,
-                'stream': False,
-                'temperature': 0.3,
-                'top_p': 0.9,
-                'num_predict': 1000  # Use num_predict instead of max_tokens for Ollama
-            }
-
-            print("Sending request to Ollama API...")
+            provider_name = "remote LLM API" if self.remote_llm else "Ollama API"
+            print(f"Sending request to {provider_name}...")
             try:
-                response = requests.post(
-                    f'{self.ollama_url}/api/generate',
-                    json=ollama_data,
-                    timeout=360  # 6 minutes timeout
-                )
+                if self.remote_llm:
+                    content = self._call_remote_llm(prompt)
+                else:
+                    content = self._call_ollama(prompt)
 
-                print(f"Ollama API response status: {response.status_code}")
-                print(f"Ollama API response: {response.text[:500]}...")  # Print first 500 chars
-
-                if response.status_code == 500:
-                    logging.error(f"Ollama API returned 500 error: {response.text}")
-                    # Trigger model downgrade for 500 errors
-                    self._handle_ollama_error("500_error")
+                if not content:
                     return []
-                elif response.status_code != 200:
-                    raise Exception(f"Ollama API request failed: {response.text}")
                     
             except requests.exceptions.Timeout:
-                logging.error("Ollama API request timed out (360s)")
+                logging.error("%s request timed out", provider_name)
                 # Trigger model downgrade for timeouts
                 self._handle_ollama_error("timeout")
                 return []
             except requests.exceptions.ConnectionError as e:
                 if "Read timed out" in str(e):
-                    logging.error("Ollama API read timeout")
+                    logging.error("%s read timeout", provider_name)
                     # Trigger model downgrade for read timeouts
                     self._handle_ollama_error("read_timeout")
                     return []
                 else:
                     raise e
 
-            response_data = response.json()
-            print(f"Ollama API response JSON keys: {list(response_data.keys())}")
-
-            if 'response' not in response_data:
-                raise Exception(f"Unexpected Ollama API response format: {response_data}")
-
-            print("Processing Ollama API response...")
-            content = response_data['response']
-            
-            # Extract pure alpha expressions by:
-            # 1. Remove markdown backticks
-            # 2. Remove numbering (e.g., "1. ", "2. ")
-            # 3. Skip comments
-            alpha_ideas = []
-            for line in content.split('\n'):
-                line = line.strip()
-                if not line or line.startswith('#') or line.startswith('*'):
-                    continue
-                # Remove numbering and backticks
-                line = line.replace('`', '')
-                if '. ' in line:
-                    line = line.split('. ', 1)[1]
-                if line and not line.startswith('Comment:'):
-                    alpha_ideas.append(line)
+            print(f"Processing {provider_name} response...")
+            alpha_ideas = self._extract_alpha_ideas(content)
             
             print(f"Generated {len(alpha_ideas)} alpha ideas")
             for i, alpha in enumerate(alpha_ideas, 1):
@@ -377,12 +615,15 @@ market_ret = ts_product(1+group_mean(returns,1,market),250)-1;rfr = vec_avg(fnd6
             return []
     
     def _handle_ollama_error(self, error_type: str):
-        """Handle Ollama errors by downgrading model if needed."""
+        """Handle LLM errors by downgrading local model if needed."""
         self.error_count += 1
-        logging.warning(f"Ollama error ({error_type}) - Count: {self.error_count}/{self.max_errors_before_downgrade}")
+        logging.warning(f"LLM error ({error_type}) - Count: {self.error_count}/{self.max_errors_before_downgrade}")
         
         if self.error_count >= self.max_errors_before_downgrade:
-            self._downgrade_model()
+            if self.remote_llm:
+                logging.warning("Remote LLM is configured; skipping local Ollama model downgrade")
+            else:
+                self._downgrade_model()
             self.error_count = 0  # Reset error count after downgrade
     
     def _downgrade_model(self):
@@ -780,7 +1021,7 @@ def tokenize_expression(expr):
 
 def generate_alpha():
     """Generate new alpha expression"""
-    generator = AlphaGenerator("./credential.txt", "http://localhost:11434")
+    generator = AlphaGenerator("./credentials.txt", "http://localhost:11434")
     data_fields = generator.get_data_fields()
     operators = generator.get_operators()
     
@@ -805,9 +1046,9 @@ def generate_alpha():
     return None
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate and test alpha factors using WorldQuant Brain API with Ollama/FinGPT')
-    parser.add_argument('--credentials', type=str, default='./credential.txt',
-                      help='Path to credentials file (default: ./credential.txt)')
+    parser = argparse.ArgumentParser(description='Generate and test alpha factors using WorldQuant Brain API with a local or remote LLM')
+    parser.add_argument('--credentials', type=str, default='./credentials.txt',
+                      help='Path to credentials file (default: ./credentials.txt, falls back to credential.txt if present)')
     parser.add_argument('--output-dir', type=str, default='./results',
                       help='Directory to save results (default: ./results)')
     parser.add_argument('--batch-size', type=int, default=3,
@@ -818,9 +1059,15 @@ def main():
                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                       help='Set the logging level (default: INFO)')
     parser.add_argument('--ollama-url', type=str, default='http://localhost:11434',
-                      help='Ollama API URL (default: http://localhost:11434)')
+                      help='Ollama API URL fallback when no remote LLM config is found')
     parser.add_argument('--ollama-model', type=str, default='deepseek-r1:8b',
-                                             help='Ollama model to use (default: deepseek-r1:8b for RTX A4000)')
+                                             help='Ollama model fallback when no remote LLM config is found')
+    parser.add_argument('--llm-base-url', type=str, default=None,
+                      help='OpenAI-compatible remote LLM base URL; defaults to base_url from credentials')
+    parser.add_argument('--llm-api-key', type=str, default=None,
+                      help='OpenAI-compatible remote LLM API key; defaults to OPENAI_API_KEY from credentials or environment')
+    parser.add_argument('--llm-model', type=str, default=None,
+                      help='OpenAI-compatible remote LLM model; defaults to OPENAI_MODEL/LLM_MODEL or an inferred provider default')
     parser.add_argument('--max-concurrent', type=int, default=2,
                       help='Maximum concurrent simulations (default: 2)')
     
@@ -840,8 +1087,15 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     try:
-        # Initialize alpha generator with Ollama
-        generator = AlphaGenerator(args.credentials, args.ollama_url, args.max_concurrent)
+        # Initialize alpha generator with remote LLM when configured, otherwise Ollama
+        generator = AlphaGenerator(
+            args.credentials,
+            args.ollama_url,
+            args.max_concurrent,
+            llm_base_url=args.llm_base_url,
+            llm_api_key=args.llm_api_key,
+            llm_model=args.llm_model,
+        )
         generator.model_name = args.ollama_model  # Set the model name
         generator.initial_model = args.ollama_model  # Set the initial model for reset
         
@@ -855,7 +1109,10 @@ def main():
         
         print(f"Starting continuous alpha mining with batch size {args.batch_size}")
         print(f"Results will be saved to {args.output_dir}")
-        print(f"Using Ollama at {args.ollama_url}")
+        if generator.remote_llm:
+            print(f"Using remote LLM at {generator.remote_llm.base_url} with model {generator.remote_llm.model}")
+        else:
+            print(f"Using Ollama at {args.ollama_url}")
         
         while True:
             try:

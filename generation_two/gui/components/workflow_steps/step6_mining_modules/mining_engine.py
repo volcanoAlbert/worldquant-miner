@@ -73,6 +73,64 @@ class MiningEngine:
         self.operation_start_time = time.time()
         self.templates_generated_count = 0
         self.simulations_completed_count = 0
+
+    @staticmethod
+    def _format_metric(value, precision: int = 2) -> str:
+        """Format optional numeric metrics from the simulation API."""
+        try:
+            if value is None:
+                return "N/A"
+            return f"{float(value):.{precision}f}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def _validate_before_submit(self, template: str, region: str):
+        """Run local expression checks before spending a remote simulation call."""
+        if not self.generator or not self.generator.template_generator:
+            return None
+
+        available_operators = None
+        if hasattr(self.generator.template_generator, 'operator_fetcher'):
+            operator_fetcher = self.generator.template_generator.operator_fetcher
+            available_operators = operator_fetcher.operators if operator_fetcher else None
+
+        available_fields = self.generator.template_generator.get_data_fields_for_region(region)
+        if not available_operators or not available_fields:
+            logger.debug("Skipping mining local validation: missing operators or fields")
+            return None
+
+        try:
+            from generation_two.core.local_expression_validator import validate_expression_locally
+
+            return validate_expression_locally(template, available_operators, available_fields)
+        except Exception as e:
+            logger.debug(f"Mining local expression validation failed unexpectedly: {e}")
+            return None
+
+    def _normalize_before_submit(self, template: str) -> str:
+        """Apply local operator-parameter normalization before validation/submission."""
+        if not self.generator or not self.generator.template_generator:
+            return template
+
+        available_operators = None
+        if hasattr(self.generator.template_generator, 'operator_fetcher'):
+            operator_fetcher = self.generator.template_generator.operator_fetcher
+            available_operators = operator_fetcher.operators if operator_fetcher else None
+
+        if not available_operators:
+            return template
+
+        try:
+            from generation_two.core.operator_parameter_normalizer import normalize_operator_parameters
+
+            normalized_template, fixes = normalize_operator_parameters(template, available_operators)
+            if fixes and normalized_template != template:
+                logger.info(f"Applied mining pre-submit operator normalization: {fixes}")
+                return normalized_template
+        except Exception as e:
+            logger.debug(f"Mining pre-submit operator normalization skipped: {e}")
+
+        return template
     
     def start(self):
         """Start mining engine"""
@@ -235,7 +293,7 @@ class MiningEngine:
                 for template, template_region in unsimulated:
                     # Check if this template is currently in any slot
                     is_in_use = False
-                    for slot_id in range(8):
+                    for slot_id in range(self.slot_manager.max_slots):
                         slot = self.slot_manager.get_slot_status(slot_id)
                         if slot and slot.template == template and slot.region == template_region:
                             is_in_use = True
@@ -266,8 +324,12 @@ class MiningEngine:
         """Process pending simulations with 20/80 logic: 20% new generation, 80% reuse from database"""
         import random
         
-        # Determine how many slots we need to fill (up to 8)
-        available_slots = 8 - len([s for s in range(8) if self.slot_manager.get_slot_status(s).status != SlotStatus.IDLE])
+        # Determine how many slots we need to fill.
+        available_slots = self.slot_manager.max_slots - len([
+            slot_id
+            for slot_id in range(self.slot_manager.max_slots)
+            if self.slot_manager.get_slot_status(slot_id).status != SlotStatus.IDLE
+        ])
         if available_slots <= 0:
             return
         
@@ -516,19 +578,47 @@ class MiningEngine:
                 if slot:
                     slot.add_log("❌ Skipping submission - template has unreplaced placeholders")
                 return
+
+            normalized_template = self._normalize_before_submit(template)
+            if normalized_template != template:
+                slot = self.slot_manager.get_slot_status(slot_id)
+                if slot:
+                    slot.add_log(f"🔧 Normalized expression before submit: {normalized_template[:80]}...")
+                template = normalized_template
             
             # Update slot
             slot = self.slot_manager.get_slot_status(slot_id)
             if slot:
                 slot.add_log(f"[{region}] Submitting...")
+
+            local_validation = self._validate_before_submit(template, region)
+            if local_validation and not local_validation.is_valid:
+                error_msg = local_validation.summary()
+                slot = self.slot_manager.get_slot_status(slot_id)
+                if slot:
+                    slot.add_log(f"❌ Local validation failed: {error_msg}")
+                    slot.add_log("❌ Skipping API submission to avoid known invalid expression")
+                self.slot_manager.release_slot(slot_id, success=False, error=f"Local validation failed: {error_msg}")
+                self._update_slot(slot_id, template, region, 0, "Local validation failed", "FAILED")
+                self._log(f"❌ {region}: Local validation failed: {error_msg}")
+                if self.generator.template_generator.template_validator:
+                    self.generator.template_generator.template_validator.learn_from_simulation_error(
+                        template, error_msg, None
+                    )
+                return
+
             self.slot_manager.update_slot_progress(slot_id, percent=10, message="Submitting...", api_status="PENDING")
             self._update_slot(slot_id, template, region, 10, "Submitting...")
 
             # Submit
-            progress_url = self.simulator_tester.submit_simulation(template, region, settings)
-            if not progress_url:
-                self.slot_manager.release_slot(slot_id, success=False, error="Failed to submit")
+            submission = self.simulator_tester.submit_simulation(template, region, settings)
+            if not submission:
+                submit_error = submission.error_message or "Failed to submit"
+                self.slot_manager.release_slot(slot_id, success=False, error=submit_error)
+                self._update_slot(slot_id, template, region, 0, submit_error, "FAILED")
+                self._log(f"❌ {region}: {submit_error[:100]}")
                 return
+            progress_url = submission.progress_url
             
             # Monitor
             def progress_callback(percent, message, api_status):
@@ -538,10 +628,13 @@ class MiningEngine:
                     slot.add_log(f"[{api_status}] {message}")
                 self._update_slot(slot_id, template, region, percent, message)
             
-            result = self.simulator_tester.monitor_simulation(
-                progress_url, template, region, settings,
-                progress_callback=progress_callback
-            )
+            try:
+                result = self.simulator_tester.monitor_simulation(
+                    progress_url, template, region, settings,
+                    progress_callback=progress_callback
+                )
+            finally:
+                self.simulator_tester.release_simulation_slot(submission)
             
             # Handle refeed if failed
             if result and not result.success:
@@ -577,13 +670,15 @@ class MiningEngine:
             
             # Update display
             status = "SUCCESS" if result.success else "FAILED"
-            message = f"Sharpe: {result.sharpe:.2f}" if result.success else (result.error_message[:30] if result.error_message else "Failed")
+            message = f"Sharpe: {self._format_metric(result.sharpe)}" if result.success else (result.error_message[:30] if result.error_message else "Failed")
             self._update_slot(slot_id, template, region, 100 if result.success else 0, message, status)
             
             # Log
             if result.success:
                 self.simulations_completed_count += 1
-                self._log(f"✅ {region}: Sharpe={result.sharpe:.2f}, Fitness={result.fitness:.2f} (Total: {self.simulations_completed_count})")
+                sharpe = self._format_metric(result.sharpe)
+                fitness = self._format_metric(result.fitness)
+                self._log(f"✅ {region}: Sharpe={sharpe}, Fitness={fitness} (Total: {self.simulations_completed_count})")
             else:
                 self._log(f"❌ {region}: {result.error_message[:50] if result.error_message else 'Unknown error'}")
                 
@@ -715,9 +810,31 @@ class MiningEngine:
             slot = self.slot_manager.get_slot_status(slot_id)
             if slot:
                 slot.add_log(f"✅ Fixed with {len(fixes)} corrections, retrying...")
-            progress_url = self.simulator_tester.submit_simulation(fixed_template, region, settings)
+
+            normalized_template = self._normalize_before_submit(fixed_template)
+            if normalized_template != fixed_template:
+                slot = self.slot_manager.get_slot_status(slot_id)
+                if slot:
+                    slot.add_log(f"🔧 Normalized retry expression: {normalized_template[:80]}...")
+                fixed_template = normalized_template
+
+            local_validation = self._validate_before_submit(fixed_template, region)
+            if local_validation and not local_validation.is_valid:
+                error_msg = local_validation.summary()
+                slot = self.slot_manager.get_slot_status(slot_id)
+                if slot:
+                    slot.add_log(f"❌ Local validation failed before retry: {error_msg}")
+                    slot.add_log("❌ Skipping API resubmission")
+                if self.generator.template_generator.template_validator:
+                    self.generator.template_generator.template_validator.learn_from_simulation_error(
+                        fixed_template, error_msg, None
+                    )
+                return None
+
+            submission = self.simulator_tester.submit_simulation(fixed_template, region, settings)
             
-            if progress_url:
+            if submission:
+                progress_url = submission.progress_url
                 def progress_callback(percent, message, api_status):
                     self.slot_manager.update_slot_progress(slot_id, percent=percent, message=message, api_status=api_status)
                     slot = self.slot_manager.get_slot_status(slot_id)
@@ -725,11 +842,19 @@ class MiningEngine:
                         slot.add_log(f"[{api_status}] {message}")
                     self._update_slot(slot_id, fixed_template, region, percent, message)
                 
-                result = self.simulator_tester.monitor_simulation(
-                    progress_url, fixed_template, region, settings,
-                    progress_callback=progress_callback
-                )
+                try:
+                    result = self.simulator_tester.monitor_simulation(
+                        progress_url, fixed_template, region, settings,
+                        progress_callback=progress_callback
+                    )
+                finally:
+                    self.simulator_tester.release_simulation_slot(submission)
                 return result
+            else:
+                submit_error = submission.error_message or "Failed to resubmit fixed template"
+                slot = self.slot_manager.get_slot_status(slot_id)
+                if slot:
+                    slot.add_log(f"❌ Failed to resubmit fixed template: {submit_error}")
         
         return None
     

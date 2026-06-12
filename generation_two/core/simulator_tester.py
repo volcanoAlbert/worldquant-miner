@@ -6,11 +6,18 @@ Handles simulation submission and monitoring
 import logging
 import requests
 import time
+import threading
 from typing import Dict, Optional, List, Callable
 from dataclasses import dataclass
 from concurrent.futures import Future, ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+MAX_CONCURRENT_SIMULATIONS = 3
+SIMULATION_MAX_WAIT_TIME = 900
+SUBMIT_CONCURRENCY_RETRY_ATTEMPTS = 20
+SUBMIT_CONCURRENCY_RETRY_DELAY = 30
+_SIMULATION_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_SIMULATIONS)
 
 
 @dataclass
@@ -71,6 +78,23 @@ class SimulationResult:
     raw_data: str = ""  # JSON string of full API response
 
 
+@dataclass
+class SubmissionResult:
+    """Result from submitting a simulation request."""
+    progress_url: str = ""
+    success: bool = False
+    error_message: str = ""
+    status_code: int = 0
+    response_text: str = ""
+    slot_acquired: bool = False
+
+    def __bool__(self) -> bool:
+        return self.success and bool(self.progress_url)
+
+    def __str__(self) -> str:
+        return self.progress_url if self.progress_url else self.error_message
+
+
 class SimulatorTester:
     """
     Handles simulation submission and monitoring
@@ -90,15 +114,25 @@ class SimulatorTester:
         self.sess = session
         self.region_configs = region_configs
         self.template_generator = template_generator  # For re-authentication if needed
-        self.executor = ThreadPoolExecutor(max_workers=8)
+        self.executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_SIMULATIONS)
+        self.simulation_semaphore = _SIMULATION_SEMAPHORE
         self.active_simulations = {}  # {alpha_id: Future}
+
+    def release_simulation_slot(self, submission: Optional[SubmissionResult]):
+        """Release a simulation concurrency slot held by a successful submission."""
+        if submission and submission.slot_acquired:
+            try:
+                self.simulation_semaphore.release()
+                submission.slot_acquired = False
+            except ValueError:
+                logger.warning("Simulation concurrency slot was already released")
     
     def submit_simulation(
         self, 
         template: str, 
         region: str, 
         settings: SimulationSettings
-    ) -> Optional[str]:
+    ) -> SubmissionResult:
         """
         Submit a template for simulation
         
@@ -108,15 +142,20 @@ class SimulatorTester:
             settings: Simulation settings
             
         Returns:
-            Progress URL if successful, None otherwise
+            SubmissionResult with progress URL or failure details
         """
+        acquired_slot = False
         try:
             from dataclasses import asdict
             
             region_config = self.region_configs.get(region)
             if not region_config:
                 logger.error(f"Unknown region: {region}")
-                return None
+                return SubmissionResult(error_message=f"Unknown region: {region}")
+
+            logger.debug("Waiting for simulation concurrency slot (limit=%s)", MAX_CONCURRENT_SIMULATIONS)
+            self.simulation_semaphore.acquire()
+            acquired_slot = True
             
             # Verify session has cookies before making request (for debugging)
             if not self.sess.cookies:
@@ -159,38 +198,94 @@ class SimulatorTester:
                 'regular': template
             }
             
-            # Use make_api_request if available, otherwise use session directly
-            if self.template_generator and hasattr(self.template_generator, 'make_api_request'):
-                response = self.template_generator.make_api_request(
-                    'POST',
-                    'https://api.worldquantbrain.com/simulations',
-                    json=simulation_data
-                )
-            else:
-                # Fallback to direct session usage (maintains backward compatibility)
-                response = self.sess.post(
-                    'https://api.worldquantbrain.com/simulations',
-                    json=simulation_data
-                )
+            submit_attempt = 0
+            while True:
+                # Use make_api_request if available, otherwise use session directly
+                if self.template_generator and hasattr(self.template_generator, 'make_api_request'):
+                    response = self.template_generator.make_api_request(
+                        'POST',
+                        'https://api.worldquantbrain.com/simulations',
+                        json=simulation_data
+                    )
+                else:
+                    # Fallback to direct session usage (maintains backward compatibility)
+                    response = self.sess.post(
+                        'https://api.worldquantbrain.com/simulations',
+                        json=simulation_data
+                    )
+
+                response_text = response.text[:1000]
+                if (
+                    response.status_code == 429
+                    and 'CONCURRENT_SIMULATION_LIMIT_EXCEEDED' in response_text
+                    and submit_attempt < SUBMIT_CONCURRENCY_RETRY_ATTEMPTS
+                ):
+                    submit_attempt += 1
+                    retry_after = response.headers.get('Retry-After')
+                    try:
+                        retry_delay = float(retry_after) if retry_after else SUBMIT_CONCURRENCY_RETRY_DELAY
+                    except (TypeError, ValueError):
+                        retry_delay = SUBMIT_CONCURRENCY_RETRY_DELAY
+                    logger.warning(
+                        "WorldQuant simulation concurrency limit reached; waiting %.0fs before retry %s/%s",
+                        retry_delay,
+                        submit_attempt,
+                        SUBMIT_CONCURRENCY_RETRY_ATTEMPTS,
+                    )
+                    time.sleep(retry_delay)
+                    continue
+                break
             
             if response.status_code == 201:
                 progress_url = response.headers.get('Location')
                 if not progress_url:
                     logger.error("No Location header in response")
-                    return None
+                    return SubmissionResult(
+                        success=False,
+                        error_message="No Location header in simulation response",
+                        status_code=response.status_code,
+                        response_text=response.text[:1000],
+                    )
                 logger.info(f"Submitted simulation: {progress_url} for region {region}")
-                return progress_url
+                return SubmissionResult(
+                    progress_url=progress_url,
+                    success=True,
+                    status_code=response.status_code,
+                    response_text=response.text[:1000],
+                    slot_acquired=True,
+                )
             elif response.status_code == 401:
                 logger.error(f"Authentication expired - session cookies may have been lost")
                 logger.error(f"Response: {response.text}")
-                return None
+                return SubmissionResult(
+                    success=False,
+                    error_message="Authentication expired",
+                    status_code=response.status_code,
+                    response_text=response.text[:1000],
+                )
             else:
-                logger.error(f"Failed to submit simulation: {response.status_code} - {response.text}")
-                return None
+                logger.error(
+                    "Failed to submit simulation: status=%s template=%s response=%s",
+                    response.status_code,
+                    template[:300],
+                    response_text,
+                )
+                return SubmissionResult(
+                    success=False,
+                    error_message=f"Submit failed HTTP {response.status_code}: {response_text[:300]}",
+                    status_code=response.status_code,
+                    response_text=response_text,
+                )
                 
         except Exception as e:
             logger.error(f"Error submitting simulation: {e}")
-            return None
+            return SubmissionResult(error_message=f"Submit exception: {e}")
+        finally:
+            if acquired_slot:
+                # Successful submissions keep the slot until monitoring finishes.
+                # Failed submissions release immediately because no remote simulation is running.
+                if 'response' not in locals() or response.status_code != 201 or not response.headers.get('Location'):
+                    self.simulation_semaphore.release()
     
     def monitor_simulation(
         self, 
@@ -198,7 +293,7 @@ class SimulatorTester:
         template: str, 
         region: str, 
         settings: SimulationSettings,
-        max_wait_time: int = 300,
+        max_wait_time: int = SIMULATION_MAX_WAIT_TIME,
         progress_callback: Optional[Callable[[float, str, str], None]] = None
     ) -> SimulationResult:
         """
@@ -267,33 +362,55 @@ class SimulatorTester:
                     continue
                 
                 data = response.json()
-                status = data.get('status', 'UNKNOWN')
+                status_raw = data.get('status') or data.get('state') or ""
+                status = str(status_raw).upper() if status_raw else ""
+                api_progress = data.get('progress')
                 
                 # Calculate elapsed time once
                 elapsed = time.time() - start_time
                 
-                # Handle empty or missing status - treat as PENDING if just submitted
-                if status == 'UNKNOWN' or not status:
-                    # If we just started monitoring (elapsed < 10s), treat as PENDING
-                    if elapsed < 10:
+                # Handle progress-only responses like {"progress": 0.35}.
+                if not status:
+                    if api_progress is not None:
+                        status = 'PENDING' if elapsed < 10 else 'RUNNING'
+                        logger.debug(f"Progress-only simulation response: progress={api_progress}, treating as {status}")
+                    elif elapsed < 10:
                         status = 'PENDING'
                         logger.debug(f"Status missing/unknown in API response, treating as PENDING (elapsed: {elapsed:.1f}s)")
                     else:
+                        status = 'UNKNOWN'
                         # Log the actual response for debugging
                         logger.warning(f"Unknown status in API response: {data}")
                 
                 # Calculate progress based on status and elapsed time
-                if status == 'COMPLETE':
+                complete_statuses = {'COMPLETE', 'COMPLETED', 'DONE'}
+                warning_statuses = {'WARNING', 'WARN'}
+                failed_statuses = {'FAIL', 'FAILED', 'ERROR', 'CANCELLED', 'CANCELED'}
+                pending_statuses = {'PENDING', 'CREATED', 'SUBMITTED', 'QUEUED'}
+                running_statuses = {'RUNNING', 'IN_PROGRESS', 'PROCESSING'}
+
+                if status == 'RUNNING' and api_progress is not None:
+                    try:
+                        progress_value = float(api_progress)
+                        progress_percent = progress_value * 100 if progress_value <= 1 else progress_value
+                        progress_percent = max(0.0, min(95.0, progress_percent))
+                    except (TypeError, ValueError):
+                        progress_percent = min(95.0, 15.0 + (elapsed / max_wait_time) * 70)
+                    progress_msg = f"🔄 Simulation running... ({int(progress_percent)}%)"
+                elif status in complete_statuses:
                     progress_percent = 100.0
                     progress_msg = "✅ Simulation complete"
-                elif status in ['FAILED', 'ERROR']:
+                elif status in warning_statuses:
                     progress_percent = 100.0
-                    progress_msg = f"❌ Simulation failed: {data.get('message', 'Unknown error')[:50]}"
-                elif status == 'PENDING' or status == 'CREATED' or status == 'SUBMITTED' or status == 'QUEUED':
+                    progress_msg = "⚠️ Simulation complete with warnings"
+                elif status in failed_statuses:
+                    progress_percent = 100.0
+                    progress_msg = f"❌ Simulation failed: {data.get('message') or data.get('error') or 'Unknown error'}"[:80]
+                elif status in pending_statuses:
                     # Treat various "just submitted" statuses as PENDING
                     progress_percent = min(15.0, (elapsed / max_wait_time) * 15)
                     progress_msg = f"⏳ Simulation pending... ({int(elapsed)}s)"
-                elif status == 'RUNNING' or status == 'IN_PROGRESS' or status == 'PROCESSING':
+                elif status in running_statuses:
                     # Estimate progress: assume simulations take 30-120 seconds typically
                     # Use elapsed time as rough estimate, but show more granular progress
                     base_progress = 15.0  # Start at 15% after submission
@@ -325,7 +442,7 @@ class SimulatorTester:
                 # Update last_status for next iteration
                 last_status = status
                 
-                if status == 'COMPLETE':
+                if status in complete_statuses or status in warning_statuses:
                     # Get alpha ID from the simulation response
                     alpha_id_raw = data.get('alpha', '')
                     # Ensure alpha_id is a string, not a tuple or list
@@ -344,12 +461,6 @@ class SimulatorTester:
                             alpha_id="",
                             timestamp=time.time()
                         )
-                    
-                    # Learn from simulation error if template_generator has validator
-                    if self.template_generator and hasattr(self.template_generator, 'template_validator'):
-                        validator = self.template_generator.template_validator
-                        if validator:
-                            validator.learn_from_simulation_error(template, "No alpha ID in response")
                     
                     # Get alpha details from the alpha endpoint
                     if self.template_generator and hasattr(self.template_generator, 'make_api_request'):
@@ -384,7 +495,7 @@ class SimulatorTester:
                         checks_json = json.dumps(checks_data) if checks_data else ""
                         
                         # Check for warnings (v2 style: mark warnings as red if no red errors)
-                        has_warnings = self._has_warnings_only(checks_data)
+                        has_warnings = self._has_warnings_only(checks_data) or status in warning_statuses
                         # If there are warnings but no red errors, mark as failed (red) like v2
                         is_success = not has_warnings
                         warning_message = ""
@@ -436,8 +547,8 @@ class SimulatorTester:
                             alpha_id=alpha_id,
                             timestamp=time.time()
                         )
-                elif status in ['FAILED', 'ERROR']:
-                    error_msg = data.get('message', 'Unknown error')
+                elif status in failed_statuses:
+                    error_msg = data.get('message') or data.get('error') or data.get('detail') or f"Simulation failed with status {status}"
                     
                     # Learn from simulation error
                     if self.template_generator and hasattr(self.template_generator, 'template_validator'):
@@ -541,11 +652,14 @@ class SimulatorTester:
                     region=region,
                     settings=settings,
                     success=False,
-                    error_message="Failed to submit",
+                    error_message=progress_url.error_message or "Failed to submit",
                     timestamp=time.time()
                 )
             
-            return self.monitor_simulation(progress_url, template, region, settings)
+            try:
+                return self.monitor_simulation(progress_url.progress_url, template, region, settings)
+            finally:
+                self.release_simulation_slot(progress_url)
         
         future = self.executor.submit(run_simulation)
         return future
@@ -610,4 +724,3 @@ class SimulatorTester:
                 ))
         
         return results
-

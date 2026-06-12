@@ -1061,25 +1061,25 @@ FIXED EXPRESSION:"""
         import re
         
         fixed_template = template
+        valid_operators = {op.get('name', '').lower() for op in self._load_operators_from_json() if op.get('name')}
+
+        def valid_replacement(name: str) -> bool:
+            return name.lower() in valid_operators
         
-        # Replace ALL instances of incompatible operators with ts_* versions
+        # Replace ALL instances of incompatible operators, but only with operators
+        # that are actually available in the current WorldQuant operator list.
         # First pass: Replace function calls (operator(...))
+        candidate_replacements = {
+            'rank': 'ts_rank',
+            'delta': 'ts_delta',
+            'min': 'ts_min',
+            'max': 'ts_max',
+            'zscore': 'ts_zscore',
+        }
         function_replacements = [
-            (r'\badd\s*\(', 'ts_add('),
-            (r'\bsubtract\s*\(', 'ts_subtract('),
-            (r'\bmultiply\s*\(', 'ts_multiply('),
-            (r'\bdivide\s*\(', 'ts_divide('),
-            (r'\bpower\s*\(', 'ts_power('),
-            (r'\bsigned_power\s*\(', 'ts_signed_power('),
-            (r'\babs\s*\(', 'ts_abs('),
-            (r'\blog\s*\(', 'ts_log('),
-            (r'\bsqrt\s*\(', 'ts_sqrt('),
-            (r'\bmin\s*\(', 'ts_min('),
-            (r'\bmax\s*\(', 'ts_max('),
-            (r'\brank\s*\(', 'ts_rank('),
-            (r'\bdelta\s*\(', 'ts_delta('),
-            (r'\bcorrelation\s*\(', 'ts_correlation('),
-            (r'\breverse\s*\(', 'ts_reverse('),
+            (r'\b' + re.escape(source) + r'\s*\(', replacement + '(')
+            for source, replacement in candidate_replacements.items()
+            if valid_replacement(replacement)
         ]
         
         # Apply function call replacements (multiple passes for nested cases)
@@ -1088,16 +1088,11 @@ FIXED EXPRESSION:"""
                 if re.search(pattern, fixed_template, re.IGNORECASE):
                     fixed_template = re.sub(pattern, replacement, fixed_template, flags=re.IGNORECASE)
         
-        # Second pass: Replace arithmetic operators in expressions (field1 + field2 -> ts_add(field1, field2))
-        # Only replace if both sides are field identifiers (not already in function calls)
-        # Pattern: field_id + field_id (but not inside function calls)
-        arithmetic_replacements = [
-            # Match: field_id + field_id (but be careful with parentheses)
-            (r'([a-z][a-z0-9_]{10,})\s*\+\s*([a-z][a-z0-9_]{10,})', r'ts_add(\1, \2)'),
-            (r'([a-z][a-z0-9_]{10,})\s*-\s*([a-z][a-z0-9_]{10,})', r'ts_subtract(\1, \2)'),
-            (r'([a-z][a-z0-9_]{10,})\s*\*\s*([a-z][a-z0-9_]{10,})', r'ts_multiply(\1, \2)'),
-            (r'([a-z][a-z0-9_]{10,})\s*/\s*([a-z][a-z0-9_]{10,})', r'ts_divide(\1, \2)'),
-        ]
+        # Arithmetic/event-input failures are intentionally not auto-rewritten.
+        # The tempting ts_add/ts_subtract/ts_abs-style names are not valid for
+        # the current operator set, so generation should avoid these fields or
+        # wrap vector inputs explicitly instead of inventing replacement names.
+        arithmetic_replacements = []
         
         # Apply arithmetic replacements (multiple passes for nested expressions)
         for _ in range(3):
@@ -1142,24 +1137,18 @@ FIXED EXPRESSION:"""
             # Map of operators that don't support event inputs to replacements
             # Event input compatible operators: vec_*, ts_* (some), event-specific operators
             # Non-event operators: arithmetic (add, subtract, multiply, divide), cross-sectional (rank, winsorize, zscore)
-            event_input_replacements = {
-                'multiply': 'ts_multiply',  # Time series version
-                'add': 'ts_add',
-                'subtract': 'ts_subtract',
-                'divide': 'ts_divide',
-                'power': 'ts_power',
-                'signed_power': 'ts_signed_power',
-                'abs': 'ts_abs',
-                'log': 'ts_log',
-                'sqrt': 'ts_sqrt',
+            valid_operators = {op.get('name', '').lower() for op in self._load_operators_from_json() if op.get('name')}
+            candidate_replacements = {
+                'rank': 'ts_rank',
+                'delta': 'ts_delta',
                 'min': 'ts_min',
                 'max': 'ts_max',
-                'rank': 'ts_rank',  # Time series rank instead of cross-sectional
-                'delta': 'ts_delta',
-                'correlation': 'ts_correlation',
-                'winsorize': 'ts_winsorize',  # Try ts_ version if exists
-                'zscore': 'ts_zscore',  # Try ts_ version
-                'reverse': 'ts_reverse',  # Time series reverse
+                'zscore': 'ts_zscore',
+            }
+            event_input_replacements = {
+                source: replacement
+                for source, replacement in candidate_replacements.items()
+                if replacement.lower() in valid_operators
             }
             
             # Try to find replacement
@@ -1179,18 +1168,8 @@ FIXED EXPRESSION:"""
                     fixed_template = re.sub(pattern, replacement, fixed_template, flags=re.IGNORECASE)
                     fixes.append(f"Replaced {problematic_operator} with {replacement} (event input compatible)")
             else:
-                # No direct replacement - try wrapping with ts_* or using vec_* operators
-                # For arithmetic operators, try ts_* prefix
-                if problematic_operator in ['multiply', 'add', 'subtract', 'divide']:
-                    ts_version = 'ts_' + problematic_operator
-                    pattern = r'\b' + re.escape(problematic_operator) + r'\s*\('
-                    if re.search(pattern, fixed_template, re.IGNORECASE):
-                        fixed_template = re.sub(pattern, ts_version + '(', fixed_template, flags=re.IGNORECASE)
-                        fixes.append(f"Replaced {problematic_operator} with {ts_version} (event input compatible)")
-                else:
-                    # For cross-sectional operators, try removing or wrapping
-                    logger.warning(f"⚠️ No replacement found for {problematic_operator} with event inputs")
-                    fixes.append(f"Could not find replacement for {problematic_operator}")
+                logger.warning(f"⚠️ No valid local replacement found for {problematic_operator} with event inputs")
+                fixes.append(f"Could not find valid replacement for {problematic_operator}")
         
         # If still no replacement found, try to identify event input fields and replace operators
         if not fixes and region:
@@ -1206,7 +1185,7 @@ FIXED EXPRESSION:"""
                 logger.info(f"🔧 Template uses event input fields, replacing all incompatible operators")
                 fixed_template = self._aggressive_event_input_fix(template, error_message, region)
                 if fixed_template != template:
-                    fixes.append("Replaced all incompatible operators with ts_* versions for event inputs")
+                    fixes.append("Replaced incompatible operators with valid event-compatible operators")
                     return fixed_template, fixes
         
         return fixed_template, fixes
@@ -1248,24 +1227,20 @@ FIXED EXPRESSION:"""
                 if hasattr(self, '_fix_event_input_error'):
                     # Check replacement mapping
                     event_input_replacements = {
-                        'multiply': 'ts_multiply',
-                        'add': 'ts_add',
-                        'subtract': 'ts_subtract',
-                        'divide': 'ts_divide',
                         'rank': 'ts_rank',
-                        'power': 'ts_power',
-                        'signed_power': 'ts_signed_power',
-                        'abs': 'ts_abs',
-                        'log': 'ts_log',
-                        'sqrt': 'ts_sqrt',
                         'min': 'ts_min',
                         'max': 'ts_max',
                         'delta': 'ts_delta',
-                        'correlation': 'ts_correlation',
-                        'reverse': 'ts_reverse',
+                        'zscore': 'ts_zscore',
                         'negative_colocation': None,  # No direct replacement
                     }
-                    replacement = event_input_replacements.get(operator_name)
+                    raw_replacement = event_input_replacements.get(operator_name)
+                    valid_operator_names = {
+                        op.get('name', '').lower()
+                        for op in self._load_operators_from_json()
+                        if op.get('name')
+                    }
+                    replacement = raw_replacement if raw_replacement and raw_replacement.lower() in valid_operator_names else None
                 
                 # Extract AST pattern from template (only if AST is enabled)
                 ast_pattern = None
@@ -1527,6 +1502,19 @@ FIXED EXPRESSION:"""
         
         if expected is not None and actual is not None:
             logger.info(f"🔧 Fixing input count: operator has {actual} inputs, needs {expected}")
+
+            try:
+                from .operator_parameter_normalizer import normalize_operator_parameters
+
+                normalized_template, normalization_fixes = normalize_operator_parameters(
+                    fixed_template,
+                    self._load_operators_from_json()
+                )
+                if normalization_fixes:
+                    logger.info(f"🔧 Applied operator-aware parameter normalization: {normalization_fixes}")
+                    return normalized_template, normalization_fixes
+            except Exception as e:
+                logger.debug(f"Operator-aware parameter normalization failed: {e}")
             
             # Find operators in template that might have wrong parameter count
             # Pattern: operator_name(param1, param2, ...)
@@ -1646,13 +1634,29 @@ Return ONLY the fixed expression, no explanations:"""
         import re
         fixes = []
         fixed_template = template
+
+        try:
+            from .operator_parameter_normalizer import normalize_operator_parameters
+
+            normalized_template, normalization_fixes = normalize_operator_parameters(
+                fixed_template,
+                self._load_operators_from_json()
+            )
+            if normalization_fixes:
+                logger.info(f"🔧 Applied operator-aware lookback normalization: {normalization_fixes}")
+                return normalized_template, normalization_fixes
+        except Exception as e:
+            logger.debug(f"Operator-aware lookback normalization failed: {e}")
         
         # Find operators that require lookback (ts_* operators typically need lookback)
         # Pattern: operator_name(field) -> operator_name(field, 20)
-        lookback_operators = ['ts_rank', 'ts_sum', 'ts_mean', 'ts_max', 'ts_min', 'ts_std', 
-                             'ts_delta', 'ts_correlation', 'ts_covariance', 'ts_decay', 
-                             'ts_product', 'ts_argmax', 'ts_argmin', 'ts_scale', 'ts_winsorize',
-                             'ts_zscore', 'ts_log', 'ts_reverse', 'ts_abs']
+        valid_operators = {op.get('name', '').lower() for op in self._load_operators_from_json() if op.get('name')}
+        lookback_candidates = [
+            'ts_rank', 'ts_sum', 'ts_mean', 'ts_max', 'ts_min', 'ts_std_dev',
+            'ts_delta', 'ts_corr', 'ts_covariance', 'ts_decay_linear',
+            'ts_product', 'ts_arg_max', 'ts_arg_min', 'ts_scale', 'ts_zscore',
+        ]
+        lookback_operators = [op for op in lookback_candidates if op in valid_operators]
         
         for op in lookback_operators:
             # Pattern: operator(field) but not operator(field, ...)
@@ -1811,17 +1815,18 @@ Return ONLY the fixed expression, no explanations:"""
             
             # Try to find a similar operator (e.g., ts_* version)
             if unknown_op in fixed_template:
-                # Try common replacements
+                # Try common replacements, limited to real operator names.
                 replacements = {
-                    'reverse': 'ts_reverse',
-                    'log': 'ts_log',
-                    'abs': 'ts_abs',
                     'rank': 'ts_rank',
                     'sum': 'ts_sum',
                     'mean': 'ts_mean',
                     'max': 'ts_max',
                     'min': 'ts_min',
-                    'std': 'ts_std',
+                    'std': 'ts_std_dev',
+                    'corr': 'ts_corr',
+                    'correlation': 'ts_corr',
+                    'argmax': 'ts_arg_max',
+                    'argmin': 'ts_arg_min',
                 }
                 
                 replacement = replacements.get(unknown_op.lower())

@@ -92,7 +92,7 @@ class ConfigManager:
         self.add_section('simulation', {
             'max_wait_time': 300,
             'poll_interval': 10,
-            'concurrent_limit': 8,
+            'concurrent_limit': 3,
             'default_test_period': 'P1Y0M0D'
         }, "Simulation testing configuration")
         

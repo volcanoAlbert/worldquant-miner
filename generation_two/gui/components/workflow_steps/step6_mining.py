@@ -15,7 +15,7 @@ from .step6_mining_modules import MiningUI, MiningEngine
 from generation_two.core.mining import CorrelationTracker, MiningDuplicateDetector, SearchStrategyManager, SearchStrategy
 from generation_two.core.simulation_counter import SimulationCounter
 from generation_two.core.slot_manager import SlotManager
-from generation_two.core.simulator_tester import SimulationSettings
+from generation_two.core.simulator_tester import MAX_CONCURRENT_SIMULATIONS, SimulationSettings
 from generation_two.core.region_config import REGION_DEFAULT_UNIVERSE, REGION_DEFAULT_NEUTRALIZATION
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ class Step6Mining:
         
         # Initialize core components
         self.sim_counter = SimulationCounter()
-        self.mining_slot_manager = SlotManager(max_slots=8)
+        self.mining_slot_manager = SlotManager(max_slots=MAX_CONCURRENT_SIMULATIONS)
         self.correlation_tracker = CorrelationTracker()
         self.duplicate_detector = MiningDuplicateDetector()
         self.search_strategy = SearchStrategyManager(SearchStrategy.BFS)  # Can be changed to DFS
@@ -156,7 +156,7 @@ class Step6Mining:
             while self.mining_active and not self.stop_mining_flag:
                 try:
                     if self.mining_slot_manager:
-                        for slot_id in range(8):
+                        for slot_id in range(self.mining_slot_manager.max_slots):
                             slot = self.mining_slot_manager.get_slot_status(slot_id)
                             if slot.status != SlotStatus.IDLE:
                                 logs = slot.get_logs()[-50:] if len(slot.get_logs()) > 50 else slot.get_logs()

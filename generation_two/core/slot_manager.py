@@ -1,6 +1,5 @@
 """
-Slot Manager for Concurrent Simulations
-Manages 8 simulation slots with GLB taking 2 slots, others taking 1 slot
+Slot Manager for Concurrent Simulations.
 """
 
 import logging
@@ -74,12 +73,11 @@ class Slot:
 
 class SlotManager:
     """
-    Manages 8 concurrent simulation slots
+    Manages concurrent simulation slots
     
     Rules:
     - GLB region takes 2 slots
     - Other regions take 1 slot
-    - Maximum 8 slots total
     """
     
     def __init__(self, max_slots: int = 8):
@@ -211,6 +209,9 @@ class SlotManager:
                     slot.result = None
                     slot.error = None
                     slot.thread = None
+                    slot.progress_percent = 0.0
+                    slot.progress_message = ""
+                    slot.api_status = ""
                     slot.log_buffer.clear()
             
             threading.Thread(target=reset_slot, daemon=True).start()
@@ -219,6 +220,29 @@ class SlotManager:
         """Release multiple slots (for GLB which uses 2 slots)"""
         for slot_id in slot_ids:
             self.release_slot(slot_id, success, result, error)
+
+    def update_slot_status(self, slot_ids, status: str, message: str = ""):
+        """Compatibility helper for callers that mark slot groups directly."""
+        if isinstance(slot_ids, int):
+            slot_ids = [slot_ids]
+
+        status_text = str(status or "").upper()
+        if status_text in {"FAILED", "ERROR"}:
+            self.release_slots(slot_ids, success=False, error=message)
+            return
+        if status_text in {"COMPLETED", "COMPLETE", "SUCCESS"}:
+            self.release_slots(slot_ids, success=True, result={"alpha_id": message} if message else None)
+            return
+
+        with self.lock:
+            for slot_id in slot_ids:
+                slot = self.slots[slot_id]
+                if status_text in {"RUNNING", "PENDING", "SUBMITTED"}:
+                    slot.status = SlotStatus.RUNNING
+                elif status_text == "IDLE":
+                    slot.status = SlotStatus.IDLE
+                if message:
+                    slot.add_log(message)
     
     def update_slot_progress(self, slot_id: int, progress_url: str = None, percent: float = None, message: str = "", api_status: str = ""):
         """

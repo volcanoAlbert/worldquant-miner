@@ -42,6 +42,11 @@ from .ollama_request import (
     call_ollama_requests,
     create_progress_monitor
 )
+from .remote_llm import (
+    RemoteLLMConfig,
+    chat_completions_url,
+    load_remote_llm_config,
+)
 print("[ollama_manager]   ✓ modularized utilities imported", flush=True)
 
 # OLLAMA_AVAILABLE is kept for backward compatibility but always False at module level
@@ -70,7 +75,12 @@ class OllamaManager:
         model: str = "qwen2.5-coder:32b",
         timeout: int = 120,
         max_retries: int = 3,
-        rate_limit: float = 2.0  # seconds between requests
+        rate_limit: float = 2.0,  # seconds between requests
+        remote_config: Optional[RemoteLLMConfig] = None,
+        credentials_path: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+        llm_model: Optional[str] = None,
     ):
         """
         Initialize Ollama manager
@@ -87,9 +97,17 @@ class OllamaManager:
         self.timeout = timeout
         self.max_retries = max_retries
         self.rate_limit = rate_limit
+        self.remote_config = remote_config or load_remote_llm_config(
+            credentials_path=credentials_path,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            model=llm_model,
+            timeout=timeout,
+        )
+        self.provider = "remote" if self.remote_config else "ollama"
         
         # Connection state
-        self.is_available = False
+        self.is_available = bool(self.remote_config)
         self.last_check = None
         self.last_request_time = 0.0
         self.health_check_interval = 300  # Check health every 5 minutes
@@ -135,6 +153,9 @@ class OllamaManager:
                 self.session = requests.Session()
                 logger.warning("Using basic Session (no connection pooling)")
         
+        if self.remote_config:
+            logger.info("Using remote OpenAI-compatible LLM at %s with model %s", self.remote_config.base_url, self.remote_config.model)
+
         # Check initial availability (defer to avoid blocking import)
         # Don't check during __init__ - let it happen lazily on first use
         # self._check_availability()  # Commented out to prevent blocking during import
@@ -320,6 +341,107 @@ class OllamaManager:
         self._thread_local.last_request_time = time.time()
         # Also update global for stats (we're already in a lock, so just update directly)
         self.last_request_time = time.time()
+
+    def _generate_remote(
+        self,
+        prompt: str,
+        system_prompt: str = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1000,
+        progress_callback: Optional[callable] = None
+    ) -> Optional[str]:
+        """Generate text using an OpenAI-compatible remote chat completion API."""
+        if not self.remote_config:
+            return None
+
+        messages = []
+        if system_prompt:
+            messages.append({
+                'role': 'system',
+                'content': system_prompt
+            })
+        messages.append({
+            'role': 'user',
+            'content': prompt
+        })
+
+        payload = {
+            'model': self.remote_config.model,
+            'messages': messages,
+            'temperature': temperature,
+            'max_tokens': max_tokens,
+            'stream': False
+        }
+        headers = {
+            'Authorization': f'Bearer {self.remote_config.api_key}',
+            'Content-Type': 'application/json'
+        }
+
+        if progress_callback:
+            try:
+                progress_callback("Calling remote LLM...")
+            except Exception:
+                pass
+
+        with self.lock:
+            self.stats['total_requests'] += 1
+
+        try:
+            response = self.session.post(
+                chat_completions_url(self.remote_config.base_url),
+                headers=headers,
+                json=payload,
+                timeout=self.remote_config.timeout,
+            )
+
+            if response.status_code != 200:
+                logger.warning("Remote LLM returned status %s: %s", response.status_code, response.text[:300])
+                with self.lock:
+                    self.stats['failed_requests'] += 1
+                    self.consecutive_failures += 1
+                return None
+
+            data = response.json()
+            choices = data.get('choices', [])
+            if not choices:
+                logger.warning("Remote LLM response did not include choices")
+                with self.lock:
+                    self.stats['failed_requests'] += 1
+                    self.consecutive_failures += 1
+                return None
+
+            message = choices[0].get('message', {})
+            generated_text = message.get('content') or choices[0].get('text')
+            if not generated_text:
+                logger.warning("Remote LLM response did not include generated text")
+                with self.lock:
+                    self.stats['failed_requests'] += 1
+                    self.consecutive_failures += 1
+                return None
+
+            with self.lock:
+                self.stats['successful_requests'] += 1
+                self.consecutive_failures = 0
+                self.is_available = True
+
+            if progress_callback:
+                try:
+                    progress_callback("✅ Remote LLM generated")
+                except Exception:
+                    pass
+            return generated_text.strip()
+        except requests.exceptions.Timeout:
+            logger.warning("Remote LLM timed out after %ss", self.remote_config.timeout)
+        except requests.exceptions.RequestException as e:
+            logger.warning("Remote LLM request failed: %s", str(e)[:200])
+        except Exception as e:
+            logger.error("Remote LLM error: %s: %s", type(e).__name__, str(e)[:200], exc_info=True)
+
+        with self.lock:
+            self.stats['failed_requests'] += 1
+            self.consecutive_failures += 1
+            self.is_available = False
+        return None
     
     def generate(
         self, 
@@ -341,6 +463,15 @@ class OllamaManager:
         Returns:
             Generated text or None if failed
         """
+        if self.remote_config:
+            return self._generate_remote(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                progress_callback=progress_callback
+            )
+
         # V2 style: NO rate limiting - let threads run freely (ollama library handles concurrency)
         # Rate limiting was causing blocking - removed for true concurrency
         
@@ -654,6 +785,18 @@ class OllamaManager:
         Returns:
             Dict with "operators" and "fields" mappings, or None if failed
         """
+        try:
+            from generation_two.core.selection_safety import filter_generation_fields, filter_generation_operators
+
+            filtered_operators = filter_generation_operators(available_operators)
+            filtered_fields = filter_generation_fields(available_fields)
+            if filtered_operators:
+                available_operators = filtered_operators
+            if filtered_fields:
+                available_fields = filtered_fields
+        except Exception as e:
+            logger.debug(f"Selection safety filtering skipped: {e}")
+
         from generation_two.core.algorithmic_template_generator import AlgorithmicTemplateGenerator
         
         if generator is None:
@@ -810,6 +953,18 @@ Example: If the prompt lists OPERATOR1, OPERATOR2, OPERATOR3, your JSON must inc
         Returns:
             Expression with placeholders replaced, or None if failed
         """
+        try:
+            from generation_two.core.selection_safety import filter_generation_fields, filter_generation_operators
+
+            filtered_operators = filter_generation_operators(available_operators)
+            filtered_fields = filter_generation_fields(available_fields)
+            if filtered_operators:
+                available_operators = filtered_operators
+            if filtered_fields:
+                available_fields = filtered_fields
+        except Exception as e:
+            logger.debug(f"Replacement safety filtering skipped: {e}")
+
         from generation_two.core.algorithmic_template_generator import AlgorithmicTemplateGenerator
         
         # Create generator to get prompt and mappings
@@ -857,6 +1012,9 @@ Example: If the prompt lists OPERATOR1, OPERATOR2, OPERATOR3, your JSON must inc
             if normalized_placeholder not in field_placeholder_map:
                 field_placeholder_map[normalized_placeholder] = found_placeholder
         
+        selected_operator_names = {}
+        selected_field_types = {}
+
         # Replace operators (use display index -> actual index mapping)
         # Handle both uppercase OPERATOR1 and lowercase operator1
         if 'operators' in selection:
@@ -872,6 +1030,7 @@ Example: If the prompt lists OPERATOR1, OPERATOR2, OPERATOR3, your JSON must inc
                 if 0 <= actual_index < len(available_operators):
                     operator_name = available_operators[actual_index].get('name', '')
                     if operator_name:
+                        selected_operator_names[normalized_key] = operator_name
                         # Check if operator has minimum input requirements
                         metadata = generator.operator_metadata.get(operator_name)
                         if metadata and metadata.min_inputs > 1:
@@ -922,6 +1081,7 @@ Example: If the prompt lists OPERATOR1, OPERATOR2, OPERATOR3, your JSON must inc
                 if 0 <= actual_index < len(available_fields):
                     field_id = available_fields[actual_index].get('id', '')
                     if field_id:
+                        selected_field_types[normalized_key] = str(available_fields[actual_index].get('type', 'REGULAR')).upper()
                         # Replace the actual placeholder found in template (case-insensitive)
                         result = re.sub(
                             r'\b' + re.escape(actual_placeholder_in_template) + r'\b',
@@ -942,8 +1102,185 @@ Example: If the prompt lists OPERATOR1, OPERATOR2, OPERATOR3, your JSON must inc
             logger.error(f"   This indicates Ollama did not return selections for all placeholders, or replacement failed")
             # Return None to indicate failure - caller should retry or use fallback
             return None
+
+        try:
+            from generation_two.core.local_expression_validator import validate_expression_locally
+
+            local_validation = validate_expression_locally(result, available_operators, available_fields)
+            if (
+                not local_validation.is_valid
+                and selected_operator_names
+                and selected_field_types
+                and self._selection_has_vector_type_mismatch(
+                    placeholder_expression,
+                    selected_operator_names,
+                    selected_field_types,
+                )
+            ):
+                logger.warning("Local validation failed after placeholder replacement: %s", local_validation.summary())
+                fixed_result = self._repair_vector_field_selection(
+                    placeholder_expression,
+                    result,
+                    selection,
+                    available_operators,
+                    available_fields,
+                    operator_mapping,
+                    field_mapping,
+                    generator,
+                )
+                if fixed_result and fixed_result != result:
+                    repaired_validation = validate_expression_locally(fixed_result, available_operators, available_fields)
+                    if repaired_validation.is_valid:
+                        logger.info("✅ Repaired vector field selection before submission")
+                        result = fixed_result
+                    else:
+                        logger.warning("Vector field repair still invalid: %s", repaired_validation.summary())
+        except Exception as e:
+            logger.debug(f"Local validation/repair after replacement skipped: {e}")
+
+        try:
+            from generation_two.core.operator_parameter_normalizer import normalize_operator_parameters
+
+            normalized_result, parameter_fixes = normalize_operator_parameters(result, available_operators)
+            if parameter_fixes:
+                logger.info("✅ Operator parameter normalization applied: %s", parameter_fixes)
+                result = normalized_result
+        except Exception as e:
+            logger.debug(f"Operator parameter normalization skipped: {e}")
         
         return result
+
+    def _selection_has_vector_type_mismatch(
+        self,
+        placeholder_expression: str,
+        selected_operator_names: Dict[str, str],
+        selected_field_types: Dict[str, str],
+    ) -> bool:
+        """Detect whether selected vec_* operators are fed by non-vector placeholders."""
+        for op_placeholder, operator_name in selected_operator_names.items():
+            op_key = operator_name.lower()
+            if not (op_key.startswith('vec_') or op_key == 'vector_neut'):
+                continue
+
+            field_placeholders = self._field_placeholders_for_operator_argument(
+                placeholder_expression,
+                op_placeholder,
+                max_args=2 if op_key == 'vector_neut' else 1,
+            )
+            for field_placeholder in field_placeholders:
+                if selected_field_types.get(field_placeholder.upper()) != 'VECTOR':
+                    return True
+        return False
+
+    def _repair_vector_field_selection(
+        self,
+        placeholder_expression: str,
+        current_expression: str,
+        selection: Dict,
+        available_operators: List[Dict],
+        available_fields: List[Dict],
+        operator_mapping: Dict[int, int],
+        field_mapping: Dict[int, int],
+        generator: Any,
+    ) -> Optional[str]:
+        """Replace non-vector field selections under vec_* placeholders with VECTOR fields."""
+        if not selection or 'operators' not in selection or 'fields' not in selection:
+            return None
+
+        result = current_expression
+        changed = False
+        used_actual_indices = {
+            field_mapping.get(display_index, display_index)
+            for display_index in selection.get('fields', {}).values()
+        }
+        vector_actual_indices = [
+            idx for idx, field in enumerate(available_fields)
+            if str(field.get('type', '')).upper() == 'VECTOR'
+        ]
+        if not vector_actual_indices:
+            return None
+
+        for op_placeholder, display_op_index in selection.get('operators', {}).items():
+            actual_op_index = operator_mapping.get(display_op_index, display_op_index)
+            if not (0 <= actual_op_index < len(available_operators)):
+                continue
+            operator_name = available_operators[actual_op_index].get('name', '')
+            op_key = operator_name.lower()
+            if not (op_key.startswith('vec_') or op_key == 'vector_neut'):
+                continue
+
+            field_placeholders = self._field_placeholders_for_operator_argument(
+                placeholder_expression,
+                op_placeholder,
+                max_args=2 if op_key == 'vector_neut' else 1,
+            )
+            for field_placeholder in field_placeholders:
+                display_field_index = selection.get('fields', {}).get(field_placeholder.upper())
+                if display_field_index is None:
+                    continue
+                actual_field_index = field_mapping.get(display_field_index, display_field_index)
+                if (
+                    0 <= actual_field_index < len(available_fields)
+                    and str(available_fields[actual_field_index].get('type', '')).upper() == 'VECTOR'
+                ):
+                    continue
+
+                replacement_actual_index = next(
+                    (idx for idx in vector_actual_indices if idx not in used_actual_indices),
+                    vector_actual_indices[0],
+                )
+                old_field = available_fields[actual_field_index].get('id', '') if 0 <= actual_field_index < len(available_fields) else ''
+                new_field = available_fields[replacement_actual_index].get('id', '')
+                if old_field and new_field and old_field != new_field:
+                    result = re.sub(r'\b' + re.escape(old_field) + r'\b', new_field, result)
+                    used_actual_indices.add(replacement_actual_index)
+                    changed = True
+                    logger.info(
+                        "Replaced non-vector field %s with vector field %s for operator %s",
+                        old_field,
+                        new_field,
+                        operator_name,
+                    )
+
+        return result if changed else None
+
+    def _field_placeholders_for_operator_argument(
+        self,
+        expression: str,
+        operator_placeholder: str,
+        max_args: int = 1,
+    ) -> List[str]:
+        """Return DATA_FIELD placeholders in direct args of an operator placeholder."""
+        pattern = re.compile(r'\b' + re.escape(operator_placeholder) + r'\s*\(', re.IGNORECASE)
+        match = pattern.search(expression)
+        if not match:
+            return []
+
+        open_pos = expression.find('(', match.start())
+        depth = 0
+        close_pos = -1
+        for pos in range(open_pos, len(expression)):
+            if expression[pos] == '(':
+                depth += 1
+            elif expression[pos] == ')':
+                depth -= 1
+                if depth == 0:
+                    close_pos = pos
+                    break
+        if close_pos < 0:
+            return []
+
+        try:
+            from generation_two.core.operator_parameter_normalizer import split_top_level_args
+
+            args = split_top_level_args(expression[open_pos + 1:close_pos])
+        except Exception:
+            args = [expression[open_pos + 1:close_pos]]
+
+        placeholders = []
+        for arg in args[:max_args]:
+            placeholders.extend(re.findall(r'\b(DATA_FIELD\d+|data_field\d+|Data_Field\d+)\b', arg, re.IGNORECASE))
+        return [placeholder.upper() for placeholder in placeholders]
     
     def generate_template(
         self, 
@@ -1384,4 +1721,3 @@ CRITICAL FASTEXPR SYNTAX RULES:
             'failed_requests': 0,
             'fallback_used': 0
         }
-

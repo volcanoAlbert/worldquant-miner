@@ -4,6 +4,7 @@ Control self-evolution cycles
 """
 
 import tkinter as tk
+import threading
 from tkinter import ttk, scrolledtext
 from typing import Optional, Callable
 
@@ -146,37 +147,85 @@ class EvolutionPanel:
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=5)
         
         self.evolution_running = False
-    
+
     def _start_evolution(self):
         """Start evolution cycle"""
+        if self.evolution_running:
+            self._append_log("[INFO] Evolution is already running\n")
+            return
+
         if self.evolution_callback:
             objectives = self.objectives_text.get('1.0', tk.END).strip().split('\n')
             objectives = [obj for obj in objectives if obj.strip()]
-            
-            num_modules = int(self.num_modules.get())
-            
-            self.evolution_running = True
-            self.status_label.config(text="Status: Evolving...", fg=COLORS['accent_pink'])
-            self.log_text.insert(tk.END, f"[EVOLUTION] Starting cycle with {len(objectives)} objectives\n")
-            
+            if not objectives:
+                self._append_log("[ERROR] Please provide at least one objective\n")
+                return
+
             try:
-                if self.evolution_callback:
-                    result = self.evolution_callback(objectives, num_modules)
-                    if result:
-                        self.log_text.insert(tk.END, f"[SUCCESS] Evolution cycle completed\n")
-                        self.log_text.insert(tk.END, f"  Best module: {result.best_module}\n")
-                        self.log_text.insert(tk.END, f"  Score: {result.improvement_score:.3f}\n")
-            except Exception as e:
-                self.log_text.insert(tk.END, f"[ERROR] {str(e)}\n")
-            
-            self.evolution_running = False
-            self.status_label.config(text="Status: Complete", fg=COLORS['accent_green'])
-        
-        self.log_text.see(tk.END)
-    
+                num_modules = int(self.num_modules.get())
+            except ValueError:
+                self._append_log("[ERROR] Modules per Cycle must be an integer\n")
+                return
+
+            self.evolution_running = True
+            self.start_button.config(state=tk.DISABLED)
+            self.status_label.config(text="Status: Evolving...", fg=COLORS['accent_pink'])
+            self._append_log(f"[EVOLUTION] Starting cycle with {len(objectives)} objectives\n")
+
+            thread = threading.Thread(
+                target=self._run_evolution_worker,
+                args=(objectives, num_modules),
+                daemon=True,
+                name="EvolutionWorker"
+            )
+            thread.start()
+        else:
+            self._append_log("[ERROR] Evolution executor is not available\n")
+
+    def _run_evolution_worker(self, objectives, num_modules):
+        """Run evolution without blocking the Tk main loop."""
+        result = None
+        error = None
+
+        try:
+            result = self.evolution_callback(objectives, num_modules)
+        except Exception as e:
+            error = e
+
+        self.frame.after(0, lambda: self._finish_evolution(result, error))
+
+    def _finish_evolution(self, result, error):
+        """Update UI after an evolution worker completes."""
+        if error:
+            self._append_log(f"[ERROR] {str(error)}\n")
+        elif result:
+            self._append_log("[SUCCESS] Evolution cycle completed\n")
+            self._append_log(f"  Best module: {result.best_module}\n")
+            self._append_log(f"  Score: {result.improvement_score:.3f}\n")
+        else:
+            self._append_log("[INFO] Evolution completed without a result\n")
+
+        self.evolution_running = False
+        self.start_button.config(state=tk.NORMAL)
+        self.status_label.config(text="Status: Complete", fg=COLORS['accent_green'])
+
+    def _append_log(self, message: str):
+        """Append to the evolution log from the Tk thread."""
+        def update():
+            self.log_text.insert(tk.END, message)
+            self.log_text.see(tk.END)
+
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            self.frame.after(0, update)
+
     def _stop_evolution(self):
         """Stop evolution"""
+        if self.evolution_running:
+            self._append_log("[STOP] Stop requested; current LLM request will finish first\n")
+        else:
+            self._append_log("[STOP] Evolution stopped by user\n")
+
         self.evolution_running = False
         self.status_label.config(text="Status: Stopped", fg=COLORS['error'])
-        self.log_text.insert(tk.END, "[STOP] Evolution stopped by user\n")
-        self.log_text.see(tk.END)

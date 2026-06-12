@@ -8,25 +8,18 @@
     "description": "Operators that do not support event inputs (learned from simulation errors)",
     "incompatible_operators": [],
     "replacements": {
-      "multiply": "ts_multiply",
-      "add": "ts_add",
-      "subtract": "ts_subtract",
-      "divide": "ts_divide",
-      "power": "ts_power",
-      "signed_power": "ts_signed_power",
-      "abs": "ts_abs",
-      "log": "ts_log",
-      "sqrt": "ts_sqrt",
       "min": "ts_min",
       "max": "ts_max",
       "rank": "ts_rank",
       "delta": "ts_delta",
-      "correlation": "ts_correlation"
+      "zscore": "ts_zscore",
+      "correlation": "ts_corr"
     },
     "rules": [
       "Arithmetic operators (add, subtract, multiply, divide) do not support event inputs",
       "Cross-sectional operators (rank, winsorize, zscore) do not support event inputs",
-      "Use ts_* prefix versions for time series operations with event inputs",
+      "Only use replacement operators that exist in operatorRAW.json",
+      "Do not synthesize ts_* names for arithmetic transforms such as abs, reverse, add, subtract, multiply, or divide",
       "vec_* operators work with VECTOR fields, not event inputs"
     ]
   },

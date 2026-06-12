@@ -224,9 +224,8 @@ class AlgorithmicTemplateGenerator:
             if decision < 0.4:  # 40%: Nest operator
                 expression = f"OPERATOR{operator_counter}({expression})"
                 operator_counter += 1
-            elif decision < 0.7:  # 30%: Wrap with parameter
-                param = random.choice([5, 10, 20, 30, 50, 100])
-                expression = f"OPERATOR{operator_counter}({expression}, {param})"
+            elif decision < 0.7:  # 30%: Wrap; operator-specific parameters are normalized later
+                expression = f"OPERATOR{operator_counter}({expression})"
                 operator_counter += 1
             else:  # 30%: Combine with another field (ensures at least 2 inputs for operators that need it)
                 field_counter += 1
@@ -258,9 +257,8 @@ class AlgorithmicTemplateGenerator:
             if step < 0.3:  # Nest
                 expression = f"OPERATOR{operator_counter}({expression})"
                 operator_counter += 1
-            elif step < 0.6:  # Wrap with parameter
-                param = random.choice([5, 10, 20, 30, 50, 100])
-                expression = f"OPERATOR{operator_counter}({expression}, {param})"
+            elif step < 0.6:  # Wrap; operator-specific parameters are normalized later
+                expression = f"OPERATOR{operator_counter}({expression})"
                 operator_counter += 1
             else:  # Combine
                 field_counter += 1
@@ -309,9 +307,8 @@ class AlgorithmicTemplateGenerator:
         
         for i in range(num_operators):
             if random.random() < 0.5:
-                # Wrap with parameter
-                param = random.choice([5, 10, 20, 30, 50, 100])
-                expression = f"OPERATOR{operator_counter}({expression}, {param})"
+                # Wrap; operator-specific parameters are normalized later
+                expression = f"OPERATOR{operator_counter}({expression})"
             else:
                 # Simple wrap
                 expression = f"OPERATOR{operator_counter}({expression})"

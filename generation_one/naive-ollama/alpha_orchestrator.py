@@ -14,6 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 from dataclasses import dataclass
+from alpha_generator_ollama import _parse_credentials_file
 
 # Configure logging
 logging.basicConfig(
@@ -284,11 +285,11 @@ class AlphaOrchestrator:
     def setup_auth(self, credentials_path: str) -> None:
         """Set up authentication with WorldQuant Brain."""
         logger.info(f"Loading credentials from {credentials_path}")
-        with open(credentials_path) as f:
-            credentials = json.load(f)
+        credentials, _, resolved_path = _parse_credentials_file(credentials_path)
         
         username, password = credentials
         self.sess.auth = HTTPBasicAuth(username, password)
+        self.credentials_path = resolved_path
         
         logger.info("Authenticating with WorldQuant Brain...")
         response = self.sess.post('https://api.worldquantbrain.com/authentication')
@@ -558,6 +559,7 @@ class AlphaOrchestrator:
             # Run the alpha generator as a subprocess
             result = subprocess.run([
                 sys.executable, 'alpha_generator_ollama.py',
+                '--credentials', self.credentials_path,
                 '--batch-size', str(batch_size),
                 '--sleep-time', str(sleep_time),
                 '--ollama-url', self.ollama_url,
@@ -586,6 +588,7 @@ class AlphaOrchestrator:
         try:
             self.generator_process = subprocess.Popen([
                 sys.executable, 'alpha_generator_ollama.py',
+                '--credentials', self.credentials_path,
                 '--batch-size', str(batch_size),
                 '--sleep-time', str(sleep_time),
                 '--ollama-url', self.ollama_url,
@@ -757,8 +760,8 @@ class AlphaOrchestrator:
 
 def main():
     parser = argparse.ArgumentParser(description='Alpha Orchestrator - Manage alpha generation, mining, and submission')
-    parser.add_argument('--credentials', type=str, default='./credential.txt',
-                      help='Path to credentials file (default: ./credential.txt)')
+    parser.add_argument('--credentials', type=str, default='./credentials.txt',
+                      help='Path to credentials file (default: ./credentials.txt, falls back to credential.txt if present)')
     parser.add_argument('--ollama-url', type=str, default='http://localhost:11434',
                       help='Ollama API URL (default: http://localhost:11434)')
     parser.add_argument('--mode', type=str, choices=['daily', 'continuous', 'miner', 'submitter', 'generator', 'fleet-status', 'fleet-reset', 'fleet-downgrade', 'fleet-reset-app', 'restart'],

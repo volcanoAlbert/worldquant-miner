@@ -8,6 +8,7 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 from datetime import datetime, timedelta
+from alpha_generator_ollama import _parse_credentials_file
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -21,8 +22,7 @@ class ImprovedAlphaSubmitter:
         
     def setup_auth(self, credentials_path: str) -> None:
         """Set up authentication with WorldQuant Brain."""
-        with open(credentials_path) as f:
-            credentials = json.load(f)
+        credentials, _, _ = _parse_credentials_file(credentials_path)
         
         username, password = credentials
         self.sess.auth = HTTPBasicAuth(username, password)
@@ -472,8 +472,8 @@ class ImprovedAlphaSubmitter:
 
 def main():
     parser = argparse.ArgumentParser(description='Submit successful alphas to WorldQuant Brain with improved timeout handling')
-    parser.add_argument('--credentials', type=str, default='./credential.txt',
-                      help='Path to credentials file (default: ./credential.txt)')
+    parser.add_argument('--credentials', type=str, default='./credentials.txt',
+                      help='Path to credentials file (default: ./credentials.txt, falls back to credential.txt if present)')
     parser.add_argument('--batch-size', type=int, default=3,
                       help='Number of alphas to submit per batch (default: 3)')
     parser.add_argument('--interval-hours', type=int, default=24,

@@ -11,6 +11,7 @@ import time
 
 from ..ollama import OllamaManager, RegionThemeManager
 from ..ollama.duplicate_detector import DuplicateDetector
+from ..ollama.remote_llm import parse_credentials_settings
 from ..data_fetcher import OperatorFetcher, DataFieldFetcher, SmartSearchEngine
 from .template_validator import TemplateValidator
 
@@ -31,6 +32,9 @@ class TemplateGenerator:
         deepseek_api_key: str = None,
         ollama_url: str = "http://localhost:11434",
         ollama_model: str = "qwen2.5-coder:1.5b",
+        llm_base_url: str = None,
+        llm_api_key: str = None,
+        llm_model: str = None,
         db_path: str = "generation_two_backtests.db"
     ):
         """
@@ -42,6 +46,9 @@ class TemplateGenerator:
             deepseek_api_key: DeepSeek API key for LLM generation
             ollama_url: Ollama server URL
             ollama_model: Ollama model name
+            llm_base_url: OpenAI-compatible remote LLM base URL
+            llm_api_key: OpenAI-compatible remote LLM API key
+            llm_model: OpenAI-compatible remote LLM model
             db_path: Path to database for storing compiler knowledge
         """
         self.credentials_path = credentials_path
@@ -56,7 +63,11 @@ class TemplateGenerator:
         # Initialize Ollama manager (smart with fallback)
         self.ollama_manager = OllamaManager(
             base_url=ollama_url,
-            model=ollama_model
+            model=ollama_model,
+            credentials_path=credentials_path,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model
         )
         
         # Initialize theme manager
@@ -89,10 +100,12 @@ class TemplateGenerator:
             elif self.credentials_path:
                 # Try to read from file
                 try:
-                    with open(self.credentials_path, 'r') as f:
-                        credentials = json.loads(f.read().strip())
+                    credentials, _, resolved_path = parse_credentials_settings(self.credentials_path)
+                    if not credentials:
+                        raise ValueError("Invalid credential format")
                     username = credentials[0]
                     password = credentials[1]
+                    self.credentials_path = str(resolved_path)
                     # Store in memory for future re-authentication
                     self._stored_credentials = [username, password]
                 except FileNotFoundError:
@@ -981,4 +994,3 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
             logger.info(f"✅ Operator placeholder replacement ({len(replacements_made)} replacements): {template[:50]}... -> {result[:50]}...")
         
         return result
-

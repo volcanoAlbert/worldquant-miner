@@ -38,7 +38,10 @@ class EnhancedTemplateGeneratorV3:
         deepseek_api_key: str = None,
         db_path: str = "generation_two_backtests.db",
         ollama_url: str = "http://localhost:11434",
-        ollama_model: str = "qwen2.5-coder:1.5b"
+        ollama_model: str = "qwen2.5-coder:1.5b",
+        llm_base_url: str = None,
+        llm_api_key: str = None,
+        llm_model: str = None
     ):
         """
         Initialize Generation Two system
@@ -50,6 +53,9 @@ class EnhancedTemplateGeneratorV3:
             db_path: Path to backtest storage database
             ollama_url: Ollama server URL
             ollama_model: Ollama model name
+            llm_base_url: OpenAI-compatible remote LLM base URL
+            llm_api_key: OpenAI-compatible remote LLM API key
+            llm_model: OpenAI-compatible remote LLM model
         """
         # Initialize modular components with Ollama support
         self.template_generator = TemplateGenerator(
@@ -58,6 +64,9 @@ class EnhancedTemplateGeneratorV3:
             deepseek_api_key=deepseek_api_key,
             ollama_url=ollama_url,
             ollama_model=ollama_model,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
             db_path=db_path  # Pass database path to template generator
         )
         

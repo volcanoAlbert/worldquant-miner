@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 from getpass import getpass
+from ..ollama.remote_llm import parse_credentials_settings
 
 logger = logging.getLogger(__name__)
 
@@ -120,16 +121,27 @@ class CredentialManager:
                 if isinstance(creds_list, list) and len(creds_list) >= 2:
                     username = creds_list[0]
                     password = creds_list[1]
+                elif isinstance(creds_list, dict):
+                    username = creds_list.get('username') or creds_list.get('email')
+                    password = creds_list.get('password')
+                    if not username or not password:
+                        raise ValueError("Invalid credential format")
                 else:
                     raise ValueError("Invalid credential format")
             except (json.JSONDecodeError, ValueError):
-                # Try line-separated format: username\npassword
-                lines = content.split('\n')
-                if len(lines) >= 2:
-                    username = lines[0].strip()
-                    password = lines[1].strip()
+                # Try combined format: JSON credential array plus key=value LLM settings
+                parsed_credentials, _, _ = parse_credentials_settings(str(file_path))
+                if parsed_credentials:
+                    username = parsed_credentials[0]
+                    password = parsed_credentials[1]
                 else:
-                    raise ValueError("Invalid credential format")
+                    # Try line-separated format: username\npassword
+                    lines = content.split('\n')
+                    if len(lines) >= 2:
+                        username = lines[0].strip()
+                        password = lines[1].strip()
+                    else:
+                        raise ValueError("Invalid credential format")
             
             self.credentials = Credentials(username=username, password=password)
             

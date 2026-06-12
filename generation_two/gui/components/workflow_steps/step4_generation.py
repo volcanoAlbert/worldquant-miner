@@ -303,6 +303,14 @@ class Step4Generation:
                 self.generate_button.config(state=tk.NORMAL)
                 self.stop_generation_button.config(state=tk.DISABLED)
                 return
+
+            from ....core.selection_safety import filter_generation_fields, filter_generation_operators
+            generation_fields = filter_generation_fields(data_fields)
+            if len(generation_fields) != len(data_fields):
+                logger.info(
+                    f"[Step 4] Using {len(generation_fields)} stable fields for generic generation "
+                    f"(filtered from {len(data_fields)})"
+                )
             
             # Update validator with operators and fields
             if self.workflow.generator.template_generator.template_validator:
@@ -324,7 +332,13 @@ class Step4Generation:
             # Get available operators and successful patterns
             available_operators = None
             if self.workflow.generator.template_generator.operator_fetcher:
-                available_operators = self.workflow.generator.template_generator.operator_fetcher.operators
+                raw_operators = self.workflow.generator.template_generator.operator_fetcher.operators
+                available_operators = filter_generation_operators(raw_operators)
+                if len(available_operators) != len(raw_operators):
+                    logger.info(
+                        f"[Step 4] Using {len(available_operators)} stable operators for generic generation "
+                        f"(filtered from {len(raw_operators)})"
+                    )
             
             successful_patterns = None
             if self.workflow.generator.template_generator.template_validator and self.workflow.generator.template_generator.template_validator.corrector:
@@ -380,9 +394,9 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                     # V2 Approach: Select fields and operators by index, use placeholders to avoid misspelling
                     import random
                     selected_field_indices = self.workflow.generator.template_generator._select_fields_v2(
-                        data_fields, num_fields=random.randint(2, 4)
+                        generation_fields, num_fields=random.randint(2, 4)
                     )
-                    selected_fields = [data_fields[i] for i in selected_field_indices if i < len(data_fields)]
+                    selected_fields = [generation_fields[i] for i in selected_field_indices if i < len(generation_fields)]
                     
                     # Exclusive operator selection: select operators that aren't in use and haven't been overused
                     selected_operator_indices = []
@@ -923,8 +937,8 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
         # Update template
         widget['template_label'].config(text=template if template else "")
         
-        # Update progress directly (no nested frame.after)
-        if progress > 0:
+        # Update progress directly (no nested frame.after), including reset to 0 for IDLE slots.
+        if progress > 0 or status == 'IDLE':
             self._update_gen_slot_progress_direct(slot_id, progress, progress_msg, "")
         
         # Update log - only if content changed (save resources)

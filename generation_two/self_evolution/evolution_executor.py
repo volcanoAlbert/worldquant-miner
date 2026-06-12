@@ -4,6 +4,7 @@ Executes and manages self-evolution cycles
 """
 
 import logging
+import os
 import time
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
