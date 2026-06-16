@@ -38,6 +38,7 @@ class BacktestRecord:
     power_pool_corr: str = ""
     prod_corr: str = ""
     checks: str = ""
+    tags: str = ""
     # Status
     success: bool = True
     timestamp: float = 0.0
@@ -96,6 +97,7 @@ class BacktestStorage:
                 power_pool_corr TEXT,
                 prod_corr TEXT,
                 checks TEXT,
+                tags TEXT,
                 success INTEGER,
                 alpha_id TEXT,
                 error_message TEXT,
@@ -114,6 +116,8 @@ class BacktestStorage:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_success ON backtest_results(success)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON backtest_results(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_alpha_id ON backtest_results(alpha_id)')
+        self._ensure_column(cursor, 'backtest_results', 'tags', 'TEXT')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags ON backtest_results(tags)')
         
         # Create field types table for storing field type information (including event inputs)
         cursor.execute('''
@@ -217,6 +221,14 @@ class BacktestStorage:
                     f.write('')
             except:
                 pass  # Ignore if we can't create the marker file
+
+    def _ensure_column(self, cursor, table_name: str, column_name: str, column_type: str):
+        """Add a column to existing SQLite tables when needed."""
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if column_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+            logger.info(f"Added missing column {table_name}.{column_name}")
     
     def store_result(self, result) -> bool:
         """
@@ -253,6 +265,7 @@ class BacktestStorage:
                 power_pool_corr = getattr(result, 'power_pool_corr', '')
                 prod_corr = getattr(result, 'prod_corr', '')
                 checks = getattr(result, 'checks', '')
+                tags = getattr(result, 'tags', '')
                 success = getattr(result, 'success', False)
                 alpha_id = getattr(result, 'alpha_id', '')
                 error_message = getattr(result, 'error_message', '')
@@ -279,6 +292,7 @@ class BacktestStorage:
                 power_pool_corr = result.get('power_pool_corr', '')
                 prod_corr = result.get('prod_corr', '')
                 checks = result.get('checks', '')
+                tags = result.get('tags', '')
                 success = result.get('success', False)
                 alpha_id = result.get('alpha_id', '')
                 error_message = result.get('error_message', '')
@@ -286,18 +300,18 @@ class BacktestStorage:
                 raw_data = result.get('raw_data', '')
             
             cursor.execute('''
-                INSERT INTO backtest_results 
-                (template, region, sharpe, fitness, turnover, returns, drawdown, 
-                 margin, longCount, shortCount, pnl, volatility, max_drawdown, 
-                 win_rate, avg_return, correlations, power_pool_corr, prod_corr, 
-                 checks, success, alpha_id, error_message, timestamp, raw_data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                template, region, sharpe, fitness, turnover, returns, drawdown,
-                margin, longCount, shortCount, pnl, volatility, max_drawdown,
-                win_rate, avg_return, correlations, power_pool_corr, prod_corr,
-                checks, 1 if success else 0, alpha_id, error_message, timestamp, raw_data
-            ))
+                INSERT INTO backtest_results
+	                (template, region, sharpe, fitness, turnover, returns, drawdown,
+	                 margin, longCount, shortCount, pnl, volatility, max_drawdown,
+	                 win_rate, avg_return, correlations, power_pool_corr, prod_corr,
+	                 checks, tags, success, alpha_id, error_message, timestamp, raw_data)
+	                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	            ''', (
+	                template, region, sharpe, fitness, turnover, returns, drawdown,
+	                margin, longCount, shortCount, pnl, volatility, max_drawdown,
+	                win_rate, avg_return, correlations, power_pool_corr, prod_corr,
+	                checks, tags, 1 if success else 0, alpha_id, error_message, timestamp, raw_data
+	            ))
             
             conn.commit()
             conn.close()
@@ -602,6 +616,7 @@ class BacktestStorage:
         region: Optional[str] = None,
         min_sharpe: Optional[float] = None,
         success_only: bool = False,
+        tag: Optional[str] = None,
         limit: Optional[int] = None
     ) -> List[BacktestRecord]:
         """
@@ -611,6 +626,7 @@ class BacktestStorage:
             region: Filter by region
             min_sharpe: Minimum Sharpe ratio
             success_only: Only successful results
+            tag: Filter by a stored tag
             limit: Maximum number of results
             
         Returns:
@@ -623,7 +639,7 @@ class BacktestStorage:
         # Only select columns we actually need for BacktestRecord
         query = """SELECT id, template, region, sharpe, fitness, turnover, returns, drawdown,
                   margin, longCount, shortCount, pnl, volatility, max_drawdown, win_rate,
-                  avg_return, correlations, power_pool_corr, prod_corr, checks, success,
+                  avg_return, correlations, power_pool_corr, prod_corr, checks, tags, success,
                   alpha_id, error_message, timestamp, raw_data FROM backtest_results WHERE 1=1"""
         params = []
         
@@ -637,6 +653,10 @@ class BacktestStorage:
         
         if success_only:
             query += " AND success = 1"
+
+        if tag:
+            query += " AND tags LIKE ?"
+            params.append(f'%"{tag}"%')
         
         query += " ORDER BY timestamp DESC"
         
@@ -670,11 +690,12 @@ class BacktestStorage:
                 power_pool_corr=row[17] or '' if len(row) > 17 else '',
                 prod_corr=row[18] or '' if len(row) > 18 else '',
                 checks=row[19] or '' if len(row) > 19 else '',
-                success=bool(row[20] if len(row) > 20 else row[11]),
-                alpha_id=row[21] or '' if len(row) > 21 else (row[12] or '' if len(row) > 12 else ''),
-                error_message=row[22] or '' if len(row) > 22 else (row[13] or '' if len(row) > 13 else ''),
-                timestamp=row[23] or 0.0 if len(row) > 23 else (row[14] or 0.0 if len(row) > 14 else 0.0),
-                raw_data=row[24] or '' if len(row) > 24 else ''
+                tags=row[20] or '' if len(row) > 20 else '',
+                success=bool(row[21] if len(row) > 21 else row[11]),
+                alpha_id=row[22] or '' if len(row) > 22 else (row[12] or '' if len(row) > 12 else ''),
+                error_message=row[23] or '' if len(row) > 23 else (row[13] or '' if len(row) > 13 else ''),
+                timestamp=row[24] or 0.0 if len(row) > 24 else (row[14] or 0.0 if len(row) > 14 else 0.0),
+                raw_data=row[25] or '' if len(row) > 25 else ''
             ))
         
         return results
@@ -698,6 +719,19 @@ class BacktestStorage:
             region=region,
             min_sharpe=1.0,
             success_only=True,
+            limit=limit
+        )
+
+    def get_results_by_tag(
+        self,
+        tag: str,
+        region: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> List[BacktestRecord]:
+        """Retrieve results that include a stored tag."""
+        return self.get_results(
+            region=region,
+            tag=tag,
             limit=limit
         )
     
@@ -1062,4 +1096,3 @@ class BacktestStorage:
         except Exception as e:
             logger.error(f"Error getting AST patterns: {e}")
             return []
-

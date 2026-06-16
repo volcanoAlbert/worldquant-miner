@@ -152,7 +152,7 @@ class Step5Simulation:
 
         # Truncation
         tk.Label(settings_inner, text="Truncation:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
-        self.truncation_var = tk.StringVar(value="0.08")
+        self.truncation_var = tk.StringVar(value="0.05")
         truncation_entry = tk.Entry(settings_inner, textvariable=self.truncation_var, width=10)
         truncation_entry.grid(row=1, column=3, padx=5, pady=2)
 
@@ -415,7 +415,7 @@ class Step5Simulation:
         try:
             truncation = float(self.truncation_var.get())
         except ValueError:
-            truncation = 0.08
+            truncation = 0.05
 
         # Import simulation classes
         try:
@@ -1067,7 +1067,7 @@ class Step5Simulation:
                         # Update progress
                         remaining = len(template_queue)
                         completed = completed_count['successful'] + completed_count['failed']
-                        self.workflow.frame.after(0, lambda: self.sim_progress_label.config(
+                        self.workflow.run_on_ui_thread(lambda: self.sim_progress_label.config(
                             text=f"Queue: {remaining}, Completed: {completed}/{completed_count['total']}"
                         ))
 
@@ -1101,7 +1101,7 @@ class Step5Simulation:
                             break
 
                     # Final summary
-                    self.workflow.frame.after(0, lambda: self.sim_progress_label.config(text=""))
+                    self.workflow.run_on_ui_thread(lambda: self.sim_progress_label.config(text=""))
                     self._log_result("\n" + "=" * 80 + "\n")
                     self._log_result(f"📊 SIMULATION SUMMARY\n")
                     self._log_result(f"   Total: {completed_count['total']}\n")
@@ -1114,17 +1114,17 @@ class Step5Simulation:
                     self._log_result(f"\n❌ COORDINATOR ERROR: {str(e)}\n")
                 finally:
                     self.simulation_running = False
-                    self.workflow.frame.after(0, lambda: self.simulate_button.config(state=tk.NORMAL))
-                    self.workflow.frame.after(0, lambda: self.simulate_all_button.config(state=tk.NORMAL))
-                    self.workflow.frame.after(0, lambda: self.stop_simulation_button.config(state=tk.DISABLED))
-                    self.workflow.frame.after(0, lambda: self.sim_progress_label.config(text=""))
+                    self.workflow.run_on_ui_thread(lambda: self.simulate_button.config(state=tk.NORMAL))
+                    self.workflow.run_on_ui_thread(lambda: self.simulate_all_button.config(state=tk.NORMAL))
+                    self.workflow.run_on_ui_thread(lambda: self.stop_simulation_button.config(state=tk.DISABLED))
+                    self.workflow.run_on_ui_thread(lambda: self.sim_progress_label.config(text=""))
 
             # Start coordinator thread
             coordinator_thread = threading.Thread(target=simulation_coordinator, daemon=True)
             coordinator_thread.start()
             self.simulation_threads.append(coordinator_thread)
 
-            # Start slot update thread (refresh slot displays) - USE frame.after() for GUI updates
+            # Start slot update thread (refresh slot displays) - queue GUI updates on the Tk thread
             def update_slots_display():
                 """Periodically update slot displays"""
                 while self.simulation_running:
@@ -1134,7 +1134,7 @@ class Step5Simulation:
                                 slot = self.slot_manager.get_slot_status(slot_id)
                                 if slot.status != SlotStatus.IDLE:
                                     # Schedule GUI updates on main thread
-                                    self.workflow.frame.after(0, lambda sid=slot_id, s=slot: self._update_slot_display(
+                                    self.workflow.run_on_ui_thread(lambda sid=slot_id, s=slot: self._update_slot_display(
                                         sid,
                                         s.status.value.upper(),
                                         s.template[:40] + "..." if s.template else "",
@@ -1143,7 +1143,7 @@ class Step5Simulation:
                                     ))
                                     # Also update progress if available
                                     if slot.progress_percent > 0 or slot.status == SlotStatus.RUNNING:
-                                        self.workflow.frame.after(0, lambda sid=slot_id, s=slot: self._update_slot_progress(
+                                        self.workflow.run_on_ui_thread(lambda sid=slot_id, s=slot: self._update_slot_progress(
                                             sid,
                                             s.progress_percent,
                                             s.progress_message,
@@ -1166,8 +1166,8 @@ class Step5Simulation:
 
     def _log_result(self, message: str):
         """Log result to results text widget"""
-        self.workflow.frame.after(0, lambda: self.results_text.insert(tk.END, message))
-        self.workflow.frame.after(0, lambda: self.results_text.see(tk.END))
+        self.workflow.run_on_ui_thread(lambda: self.results_text.insert(tk.END, message))
+        self.workflow.run_on_ui_thread(lambda: self.results_text.see(tk.END))
 
     def _log_to_slot(self, slot_id: int, message: str):
         """Log message to a specific slot"""
@@ -1218,7 +1218,7 @@ class Step5Simulation:
             widget['log_text'].config(state=tk.DISABLED)
             widget['log_text'].see(tk.END)
 
-        self.workflow.frame.after(0, update)
+        self.workflow.run_on_ui_thread(update)
 
     def _update_slot_progress(self, slot_id: int, percent: float, message: str, api_status: str):
         """Update slot progress bar and message - OPTIMIZED to reduce memory usage"""
@@ -1292,4 +1292,4 @@ class Step5Simulation:
             except Exception as e:
                 logger.debug(f"Progress update error: {e}")
 
-        self.workflow.frame.after_idle(update)  # Use after_idle instead of after(0) to reduce priority
+        self.workflow.run_on_ui_thread(update)

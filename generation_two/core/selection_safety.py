@@ -11,13 +11,16 @@ from typing import Dict, List
 
 UNSAFE_GENERATION_OPERATORS = {
     "generate_stats",
+    # These often create coarse or compressed signals that look strong in raw
+    # metrics but fail WorldQuant's concentration/sub-universe checks.
+    "sign",
+    "sqrt",
 }
 
 STABLE_GENERATION_CATEGORIES = {
     "Arithmetic",
     "Time Series",
     "Cross Sectional",
-    "Logical",
 }
 
 

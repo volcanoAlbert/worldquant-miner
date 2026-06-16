@@ -195,7 +195,7 @@ class Step1DataFields:
             **STYLES['entry']
         )
         
-        self.storage_type.trace('w', lambda *args: self._update_storage_config_visibility())
+        self.storage_type.trace_add('write', lambda *args: self._update_storage_config_visibility())
         self._update_storage_config_visibility()
         
         # Region selection
@@ -383,6 +383,9 @@ class Step1DataFields:
         
         self.fetch_button.config(state=tk.DISABLED)
         self.fetch_status.config(text="Fetching data fields...", fg=COLORS['accent_yellow'])
+        storage_type_value = self.storage_type.get()
+        storage_path_value = self.storage_path_var.get()
+        storage_url_value = self.storage_url_var.get()
         
         def fetch_thread():
             try:
@@ -392,23 +395,23 @@ class Step1DataFields:
                 
                 for i, region in enumerate(selected_regions, 1):
                     try:
-                        self.workflow.frame.after(0, lambda r=region, idx=i, total=len(selected_regions): 
+                        self.workflow.run_on_ui_thread(lambda r=region, idx=i, total=len(selected_regions):
                             self.fetch_status.config(
                                 text=f"Fetching {r}... ({idx}/{total})",
                                 fg=COLORS['accent_yellow']
                             ))
                         
                         storage_config = {
-                            'type': self.storage_type.get(),
-                            'path': self.storage_path_var.get() if self.storage_type.get() == 'sqlite' else None,
-                            'url': self.storage_url_var.get() if self.storage_type.get() == 'remote' else None
+                            'type': storage_type_value,
+                            'path': storage_path_value if storage_type_value == 'sqlite' else None,
+                            'url': storage_url_value if storage_type_value == 'remote' else None
                         }
                         
                         fields = self.workflow.generator.template_generator.get_data_fields_for_region(region)
                         
                         if not fields or len(fields) == 0:
                             try:
-                                from ...core.region_config import get_all_universes
+                                from ....core.region_config import get_all_universes
                                 all_universes = get_all_universes(region)
                                 for universe in all_universes:
                                     fields = self.workflow.generator.template_generator.get_data_fields_for_region(
@@ -425,7 +428,7 @@ class Step1DataFields:
                         if fields:
                             total_fields += len(fields)
                             successful_regions.append((region, len(fields)))
-                            self.workflow.frame.after(0, lambda r=region, count=len(fields): 
+                            self.workflow.run_on_ui_thread(lambda r=region, count=len(fields):
                                 self.fetch_status.config(
                                     text=f"✓ Fetched {count} fields for {r}",
                                     fg=COLORS['accent_green']
@@ -435,7 +438,7 @@ class Step1DataFields:
                             
                     except Exception as e:
                         failed_regions.append((region, str(e)))
-                        self.workflow.frame.after(0, lambda r=region, err=str(e): 
+                        self.workflow.run_on_ui_thread(lambda r=region, err=str(e):
                             self.fetch_status.config(
                                 text=f"✗ Error for {r}: {err[:50]}",
                                 fg=COLORS['error']
@@ -452,34 +455,34 @@ class Step1DataFields:
                         for region, error in failed_regions:
                             summary += f"  {region}: {error}\n"
                     
-                    self.workflow.frame.after(0, lambda: self.fetch_status.config(
+                    self.workflow.run_on_ui_thread(lambda: self.fetch_status.config(
                         text=f"✓ Complete: {total_fields} fields from {len(successful_regions)} region(s)",
                         fg=COLORS['accent_green']
                     ))
-                    self.workflow.frame.after(0, lambda: messagebox.showinfo("Success", summary))
-                    self.workflow.frame.after(0, lambda: self.workflow.steps_completed.add(0))
-                    self.workflow.frame.after(0, self.workflow._save_config)
+                    self.workflow.run_on_ui_thread(lambda: messagebox.showinfo("Success", summary))
+                    self.workflow.run_on_ui_thread(lambda: self.workflow.steps_completed.add(0))
+                    self.workflow.run_on_ui_thread(self.workflow._save_config)
                 else:
                     error_summary = "Failed to fetch data fields for all regions:\n"
                     for region, error in failed_regions:
                         error_summary += f"  {region}: {error}\n"
                     
-                    self.workflow.frame.after(0, lambda: self.fetch_status.config(
+                    self.workflow.run_on_ui_thread(lambda: self.fetch_status.config(
                         text="✗ All fetches failed",
                         fg=COLORS['error']
                     ))
-                    self.workflow.frame.after(0, lambda: messagebox.showerror("Error", error_summary))
+                    self.workflow.run_on_ui_thread(lambda: messagebox.showerror("Error", error_summary))
                 
             except Exception as e:
                 error_msg = f"Unexpected error during fetch: {str(e)}"
                 logger.error(error_msg, exc_info=True)
-                self.workflow.frame.after(0, lambda: self.fetch_status.config(
+                self.workflow.run_on_ui_thread(lambda: self.fetch_status.config(
                     text=f"✗ Error: {str(e)[:50]}",
                     fg=COLORS['error']
                 ))
-                self.workflow.frame.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.workflow.run_on_ui_thread(lambda: messagebox.showerror("Error", error_msg))
             finally:
-                self.workflow.frame.after(0, lambda: self.fetch_button.config(state=tk.NORMAL))
+                self.workflow.run_on_ui_thread(lambda: self.fetch_button.config(state=tk.NORMAL))
         
         threading.Thread(target=fetch_thread, daemon=True).start()
     
@@ -497,6 +500,8 @@ class Step1DataFields:
         self.load_button.config(state=tk.DISABLED)
         self.fetch_button.config(state=tk.DISABLED)
         self.fetch_status.config(text="Loading data fields from cache...", fg=COLORS['accent_yellow'])
+        storage_type_value = self.storage_type.get()
+        storage_path_value = self.storage_path_var.get()
         
         def load_thread():
             try:
@@ -505,44 +510,60 @@ class Step1DataFields:
                 
                 for i, region in enumerate(selected_regions, 1):
                     try:
-                        self.workflow.frame.after(0, lambda r=region, idx=i, total=len(selected_regions): 
+                        self.workflow.run_on_ui_thread(lambda r=region, idx=i, total=len(selected_regions):
                             self.fetch_status.config(
                                 text=f"Loading {r}... ({idx}/{total})",
                                 fg=COLORS['accent_yellow']
                             ))
-                        
+
                         # Check cache or database
-                        cache_file = None
+                        cache_files = []
                         if self.workflow.generator.template_generator.data_field_fetcher:
                             cache_dir = self.workflow.generator.template_generator.data_field_fetcher.cache_dir
                             import glob
                             for pattern in [f"data_fields_cache_{region}_1.json", f"data_fields_cache_{region}_1_*.json"]:
                                 matches = glob.glob(str(cache_dir / pattern))
-                                if matches:
-                                    cache_file = matches[0]
-                                    break
+                                cache_files.extend(matches)
                         
-                        if cache_file and os.path.exists(cache_file):
+                        loaded_fields = []
+                        loaded_cache_file = None
+                        for cache_file in cache_files:
+                            if not os.path.exists(cache_file):
+                                continue
                             try:
                                 with open(cache_file, 'r', encoding='utf-8') as f:
-                                    sample = f.read(5000)
-                                    if sample.strip().startswith('['):
-                                        file_size = os.path.getsize(cache_file)
-                                        estimated_count = max(1, file_size // 200)
-                                        if self.workflow.generator.template_generator.data_field_fetcher:
-                                            if region not in self.workflow.generator.template_generator.data_field_fetcher.data_fields:
-                                                self.workflow.generator.template_generator.data_field_fetcher.data_fields[region] = []
-                                        successful_regions.append(region)
-                            except Exception:
-                                fields = self.workflow.generator.template_generator.get_data_fields_for_region(region, delay=1)
-                                if fields and len(fields) > 0:
-                                    successful_regions.append(region)
-                                else:
-                                    failed_regions.append(region)
+                                    fields = json.load(f)
+                                if isinstance(fields, list) and fields:
+                                    loaded_fields = fields
+                                    loaded_cache_file = cache_file
+                                    break
+                                logger.warning(f"No cached fields in {cache_file}")
+                            except Exception as e:
+                                logger.warning(f"Failed to load data fields cache {cache_file}: {e}")
+
+                        if loaded_fields:
+                            template_generator = self.workflow.generator.template_generator
+                            fetcher = template_generator.data_field_fetcher
+                            if fetcher:
+                                fetcher.data_fields[region] = loaded_fields
+
+                            if template_generator.search_engine:
+                                template_generator.search_engine.data_fields[region] = loaded_fields
+                                template_generator.search_engine._build_field_index_for_region(region, loaded_fields)
+
+                            if template_generator.template_validator:
+                                parser = getattr(template_generator.template_validator, 'parser', None)
+                                if parser:
+                                    parser.add_data_fields(loaded_fields)
+                                template_generator.template_validator.data_fields = loaded_fields
+
+                            template_generator._store_field_types(loaded_fields, region, delay=1)
+                            successful_regions.append(region)
+                            logger.info(f"Loaded {len(loaded_fields)} cached fields for {region} from {loaded_cache_file}")
                         else:
-                            storage_type = self.storage_type.get()
+                            storage_type = storage_type_value
                             if storage_type == "sqlite":
-                                db_path = self.storage_path_var.get() or "generation_two_backtests.db"
+                                db_path = storage_path_value or "generation_two_backtests.db"
                                 if os.path.exists(db_path):
                                     try:
                                         import sqlite3
@@ -577,31 +598,43 @@ class Step1DataFields:
                     status_msg = f"✅ Loaded fields for: {', '.join(successful_regions)}"
                     if failed_regions:
                         status_msg += f"\n⚠️ Not found: {', '.join(failed_regions)}"
-                    self.workflow.frame.after(0, lambda msg=status_msg: self.fetch_status.config(
-                        text=msg,
-                        fg=COLORS['accent_green'] if not failed_regions else COLORS['accent_yellow']
-                    ))
-                    if successful_regions:
+
+                    def finish_success(msg=status_msg, has_failures=bool(failed_regions)):
+                        self.fetch_status.config(
+                            text=msg,
+                            fg=COLORS['accent_green'] if not has_failures else COLORS['accent_yellow']
+                        )
                         self.workflow.steps_completed.add(0)
-                        self.workflow.frame.after(0, self.workflow._update_step_indicators)
+                        self.workflow._update_step_indicators()
+                        self.workflow._save_config()
+                        self.load_button.config(state=tk.NORMAL)
+                        self.fetch_button.config(state=tk.NORMAL)
+
+                    self.workflow.run_on_ui_thread(finish_success)
+                    # A short delayed repaint prevents an older "Loading..." callback from visually winning.
+                    self.workflow.run_on_ui_thread(finish_success, delay_ms=100)
                 else:
                     error_msg = f"❌ No cached fields found for any region.\nPlease use 'Fetch Data Fields' first."
-                    self.workflow.frame.after(0, lambda msg=error_msg: self.fetch_status.config(
-                        text=msg,
-                        fg=COLORS['error']
-                    ))
+                    def finish_error(msg=error_msg):
+                        self.fetch_status.config(text=msg, fg=COLORS['error'])
+                        self.load_button.config(state=tk.NORMAL)
+                        self.fetch_button.config(state=tk.NORMAL)
+
+                    self.workflow.run_on_ui_thread(finish_error)
                 
             except Exception as e:
                 error_msg = f"Error loading data fields: {str(e)[:100]}"
                 logger.error(error_msg, exc_info=True)
-                self.workflow.frame.after(0, lambda msg=error_msg: self.fetch_status.config(
-                    text=msg,
-                    fg=COLORS['error']
-                ))
-                self.workflow.frame.after(0, lambda: messagebox.showerror("Error", error_msg))
+                def finish_exception(msg=error_msg):
+                    self.fetch_status.config(text=msg, fg=COLORS['error'])
+                    self.load_button.config(state=tk.NORMAL)
+                    self.fetch_button.config(state=tk.NORMAL)
+                    messagebox.showerror("Error", msg)
+
+                self.workflow.run_on_ui_thread(finish_exception)
             finally:
-                self.workflow.frame.after(0, lambda: self.load_button.config(state=tk.NORMAL))
-                self.workflow.frame.after(0, lambda: self.fetch_button.config(state=tk.NORMAL))
+                self.workflow.run_on_ui_thread(lambda: self.load_button.config(state=tk.NORMAL))
+                self.workflow.run_on_ui_thread(lambda: self.fetch_button.config(state=tk.NORMAL))
         
         threading.Thread(target=load_thread, daemon=True).start()
     

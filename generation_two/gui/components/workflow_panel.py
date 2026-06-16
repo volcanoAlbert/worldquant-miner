@@ -10,6 +10,8 @@ import logging
 import json
 import time
 import threading
+import queue
+from queue import Empty
 import os
 from pathlib import Path
 
@@ -34,6 +36,9 @@ class WorkflowPanel:
         
         self.frame = tk.Frame(parent, **STYLES['frame'])
         self.frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue = queue.Queue()
+        self._ui_queue_pump_active = False
         
         self.current_step = 0
         self.steps_completed = set()
@@ -44,9 +49,57 @@ class WorkflowPanel:
         self.config_file.parent.mkdir(exist_ok=True)
         
         self._create_widgets()
+        self._start_ui_queue_pump()
         self._check_initial_state()
         # Load config asynchronously to avoid blocking GUI startup
         self._load_last_config_async()
+
+    def _start_ui_queue_pump(self):
+        """Start the Tk-thread UI task pump."""
+        if self._ui_queue_pump_active:
+            return
+
+        self._ui_queue_pump_active = True
+        try:
+            self.frame.after(100, self._drain_ui_queue)
+        except tk.TclError:
+            self._ui_queue_pump_active = False
+
+    def _drain_ui_queue(self):
+        """Run queued callbacks on Tk's owning thread."""
+        try:
+            for _ in range(100):
+                try:
+                    delay_ms, callback = self._ui_queue.get_nowait()
+                except Empty:
+                    break
+
+                try:
+                    if delay_ms and delay_ms > 0:
+                        self.frame.after(delay_ms, callback)
+                    else:
+                        callback()
+                except Exception as e:
+                    logger.debug(f"Queued workflow UI update failed: {e}", exc_info=True)
+        finally:
+            if self._ui_queue_pump_active:
+                try:
+                    if self.frame.winfo_exists():
+                        self.frame.after(100, self._drain_ui_queue)
+                    else:
+                        self._ui_queue_pump_active = False
+                except tk.TclError:
+                    self._ui_queue_pump_active = False
+
+    def run_on_ui_thread(self, callback, delay_ms: int = 0):
+        """Run a UI callback on Tk's thread without calling Tk from workers."""
+        if threading.get_ident() == self._main_thread_id:
+            if delay_ms and delay_ms > 0:
+                self.frame.after(delay_ms, callback)
+            else:
+                callback()
+        else:
+            self._ui_queue.put((delay_ms, callback))
     
     def _create_widgets(self):
         """Create workflow widgets"""
@@ -226,7 +279,7 @@ class WorkflowPanel:
         if step == 1:  # Step 2: View Operators
             # Schedule operator update after widgets are fully displayed
             # This ensures category_var and operator_listbox are ready
-            self.frame.after(50, self._update_step2_operators)
+            self.run_on_ui_thread(self._update_step2_operators, delay_ms=50)
     
     def _update_step2_operators(self):
         """Update operators for Step 2 (called after widgets are ready)"""
@@ -453,7 +506,7 @@ class WorkflowPanel:
                         logger.warning(f"Error updating GUI from config: {e}")
                 
                 # Schedule on main thread
-                self.frame.after(0, update_gui)
+                self.run_on_ui_thread(update_gui)
             
             except Exception as e:
                 logger.debug(f"Error loading last configuration: {e}")
@@ -874,7 +927,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                     logger.info(f"[Step 4] Slot {primary_slot_id+1}: Template {template_index+1} generated successfully: {template[:80]}...")
                     
                     # Update templates list
-                    self.frame.after(0, lambda: self._update_templates_list(generated_templates))
+                    self.run_on_ui_thread(lambda: self._update_templates_list(generated_templates))
                 
                 except Exception as e:
                     logger.error(f"[Step 4] Slot {primary_slot_id+1}: Generation error for template {template_index+1}: {e}", exc_info=True)
@@ -927,7 +980,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                         # Update progress
                         remaining = len(template_queue)
                         completed = completed_count['successful'] + completed_count['failed']
-                        self.frame.after(0, lambda: self.gen_progress_label.config(
+                        self.run_on_ui_thread(lambda: self.gen_progress_label.config(
                             text=f"Queue: {remaining}, Completed: {completed}/{completed_count['total']}"
                         ))
                     
@@ -936,23 +989,23 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                         thread.join(timeout=300)  # Max 5 minutes per generation
                     
                     # Final update
-                    self.frame.after(0, lambda: self.gen_progress_label.config(text=""))
-                    self.frame.after(0, lambda: self._update_templates_list(generated_templates))
+                    self.run_on_ui_thread(lambda: self.gen_progress_label.config(text=""))
+                    self.run_on_ui_thread(lambda: self._update_templates_list(generated_templates))
                     
                 except Exception as e:
                     logger.error(f"Generation coordinator error: {e}", exc_info=True)
                 finally:
                     self.generation_running = False
-                    self.frame.after(0, lambda: self.generate_button.config(state=tk.NORMAL))
-                    self.frame.after(0, lambda: self.stop_generation_button.config(state=tk.DISABLED))
-                    self.frame.after(0, lambda: self.gen_progress_label.config(text=""))
+                    self.run_on_ui_thread(lambda: self.generate_button.config(state=tk.NORMAL))
+                    self.run_on_ui_thread(lambda: self.stop_generation_button.config(state=tk.DISABLED))
+                    self.run_on_ui_thread(lambda: self.gen_progress_label.config(text=""))
             
             # Start coordinator thread
             coordinator_thread = threading.Thread(target=generation_coordinator, daemon=True)
             coordinator_thread.start()
             self.generation_threads.append(coordinator_thread)
             
-            # Start slot update thread - USE frame.after() for GUI updates
+            # Start slot update thread - queue GUI updates on the Tk thread
             def update_gen_slots_display():
                 """Periodically update generation slot displays"""
                 while self.generation_running:
@@ -962,7 +1015,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                                 slot = self.gen_slot_manager.get_slot_status(slot_id)
                                 if slot.status != SlotStatus.IDLE:
                                     # Schedule GUI updates on main thread
-                                    self.frame.after(0, lambda sid=slot_id, s=slot: self._update_gen_slot_display(
+                                    self.run_on_ui_thread(lambda sid=slot_id, s=slot: self._update_gen_slot_display(
                                         sid,
                                         s.status.value.upper(),
                                         s.template[:40] + "..." if s.template else "",
@@ -1046,7 +1099,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
             widget['log_text'].config(state=tk.DISABLED)
             widget['log_text'].see(tk.END)
         
-        self.frame.after(0, update)
+        self.run_on_ui_thread(update)
     
     def _update_gen_slot_progress(self, slot_id: int, percent: float, message: str, api_status: str):
         """Update generation slot progress bar and message"""
@@ -1092,7 +1145,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
             # Update progress message
             widget['progress_text'].config(text=message[:30] if message else "")
         
-        self.frame.after(0, update)
+        self.run_on_ui_thread(update)
     
     def _update_templates_list(self, templates: List[Dict]):
         """Update templates listbox with generated templates"""

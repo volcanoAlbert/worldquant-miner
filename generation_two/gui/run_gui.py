@@ -6,6 +6,7 @@ Launch Generation Two Cyberpunk GUI
 import sys
 import os
 import logging
+import atexit
 from pathlib import Path
 
 # Configure logging for terminal trace
@@ -30,6 +31,24 @@ logger.info(f"  Current dir: {current_dir}")
 logger.info(f"  GUI dir: {gui_dir}")
 logger.info(f"  Project root: {project_root}")
 logger.info(f"  Python path updated")
+
+pid_file = Path(gui_dir) / "generation_two_gui.pid"
+
+
+def _clear_pid_file():
+    try:
+        if pid_file.exists() and pid_file.read_text().strip() == str(os.getpid()):
+            pid_file.write_text("0\n")
+    except Exception:
+        pass
+
+
+try:
+    pid_file.write_text(f"{os.getpid()}\n")
+    atexit.register(_clear_pid_file)
+    logger.info(f"  PID file updated: {pid_file}")
+except Exception as e:
+    logger.debug(f"Could not update PID file: {e}")
 
 logger.info("Importing CyberpunkGUI...")
 try:

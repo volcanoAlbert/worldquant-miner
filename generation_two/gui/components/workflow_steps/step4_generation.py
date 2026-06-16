@@ -9,6 +9,8 @@ from typing import List, Dict
 import logging
 import time
 import threading
+import queue
+from queue import Empty
 
 from ...theme import COLORS, FONTS, STYLES
 
@@ -35,8 +37,12 @@ class Step4Generation:
         self.generation_threads = []
         self.gen_slot_manager = None
         self.generated_templates = []
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue = queue.Queue()
+        self._ui_queue_pump_active = False
         
         self._create_widgets()
+        self._start_ui_queue_pump()
     
     def _create_widgets(self):
         """Create Step 4 widgets"""
@@ -260,6 +266,46 @@ class Step4Generation:
         templates_scrollbar = tk.Scrollbar(templates_frame, orient=tk.VERTICAL, command=self.templates_listbox.yview)
         templates_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.templates_listbox.config(yscrollcommand=templates_scrollbar.set)
+
+    def _start_ui_queue_pump(self):
+        """Start the main-thread UI task pump."""
+        if self._ui_queue_pump_active:
+            return
+
+        self._ui_queue_pump_active = True
+        try:
+            self.frame.after(100, self._drain_ui_queue)
+        except tk.TclError:
+            self._ui_queue_pump_active = False
+
+    def _drain_ui_queue(self):
+        """Run queued UI tasks on the Tk main thread."""
+        try:
+            for _ in range(100):
+                try:
+                    task = self._ui_queue.get_nowait()
+                except Empty:
+                    break
+                try:
+                    task()
+                except Exception as e:
+                    logger.debug(f"Queued UI update failed: {e}", exc_info=True)
+        finally:
+            if self._ui_queue_pump_active:
+                try:
+                    if self.frame.winfo_exists():
+                        self.frame.after(100, self._drain_ui_queue)
+                    else:
+                        self._ui_queue_pump_active = False
+                except tk.TclError:
+                    self._ui_queue_pump_active = False
+
+    def _run_on_ui_thread(self, callback):
+        """Run callback now on Tk's thread, otherwise enqueue it for the UI pump."""
+        if threading.get_ident() == self._main_thread_id:
+            callback()
+        else:
+            self._ui_queue.put(callback)
     
     def _generate_alphas(self):
         """Generate alpha templates with concurrent slot-based generation"""
@@ -698,7 +744,8 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                     
                     # Update templates list (throttled - only update every few templates)
                     if len(generated_templates) % 3 == 0 or len(generated_templates) == completed_count['total']:
-                        self.workflow.frame.after_idle(lambda: self._update_templates_list(generated_templates))
+                        templates_snapshot = [dict(template) for template in generated_templates]
+                        self._run_on_ui_thread(lambda templates=templates_snapshot: self._update_templates_list(templates))
                 
                 except Exception as e:
                     # Release operators back to pool on error
@@ -760,9 +807,8 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                         if current_time_progress - update_gen_slots_display._last_progress_update >= 2.0:
                             remaining = len(template_queue)
                             completed = completed_count['successful'] + completed_count['failed']
-                            self.workflow.frame.after_idle(lambda: self.gen_progress_label.config(
-                                text=f"Queue: {remaining}, Completed: {completed}/{completed_count['total']}"
-                            ))
+                            progress_text = f"Queue: {remaining}, Completed: {completed}/{completed_count['total']}"
+                            self._run_on_ui_thread(lambda text=progress_text: self.gen_progress_label.config(text=text))
                             update_gen_slots_display._last_progress_update = current_time_progress
                     
                     # Wait for all generations to complete (non-blocking check)
@@ -776,13 +822,14 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                         time.sleep(1)  # Check every second
                     
                     # Final update (batched to reduce GUI calls)
+                    templates_snapshot = [dict(template) for template in generated_templates]
                     def final_updates():
                         self.gen_progress_label.config(text="")
-                        self._update_templates_list(generated_templates)
+                        self._update_templates_list(templates_snapshot)
                         self.generate_button.config(state=tk.NORMAL)
                         self.stop_generation_button.config(state=tk.DISABLED)
                     
-                    self.workflow.frame.after_idle(final_updates)
+                    self._run_on_ui_thread(final_updates)
                     
                 except Exception as e:
                     logger.error(f"Generation coordinator error: {e}", exc_info=True)
@@ -798,7 +845,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                         self.stop_generation_button.config(state=tk.DISABLED)
                         self.gen_progress_label.config(text="")
                     
-                    self.workflow.frame.after_idle(cleanup_updates)
+                    self._run_on_ui_thread(cleanup_updates)
             
             # Start coordinator thread
             coordinator_thread = threading.Thread(target=generation_coordinator, daemon=True)
@@ -837,7 +884,17 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                                     progress_changed = abs(slot.progress_percent - last_progress) >= 10.0
                                     
                                     if time_elapsed or status_changed or progress_changed:
-                                        updates.append((slot_id, slot))
+                                        all_logs = slot.get_logs()
+                                        display_logs = all_logs[-5:] if len(all_logs) > 5 else all_logs
+                                        updates.append((
+                                            slot_id,
+                                            slot.status.value.upper(),
+                                            slot.template[:40] + "..." if slot.template else "",
+                                            f"Region: {slot.region}" if slot.region else "",
+                                            list(display_logs),
+                                            slot.progress_percent,
+                                            slot.progress_message
+                                        ))
                                         last_update_time[slot_id] = current_time
                                         last_status[slot_id] = slot.status
                                         setattr(update_gen_slots_display, last_progress_key, slot.progress_percent)
@@ -846,30 +903,26 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
                                         if len(updates) >= max_updates_per_cycle:
                                             break
                             
-                            # Batch all GUI updates in a single after() call (more efficient)
+                            # Batch all GUI updates in a single queued task (more efficient)
                             if updates:
-                                def batch_update():
+                                updates_snapshot = list(updates)
+
+                                def batch_update(updates_to_apply=updates_snapshot):
                                     try:
-                                        for slot_id, slot in updates:
-                                            # Limit to last 5 log lines for display performance
-                                            all_logs = slot.get_logs()
-                                            display_logs = all_logs[-5:] if len(all_logs) > 5 else all_logs
-                                            
-                                            # Direct update (no nested frame.after calls)
+                                        for slot_id, status, template, info, logs, progress, progress_msg in updates_to_apply:
                                             self._update_gen_slot_display_direct(
                                                 slot_id,
-                                                slot.status.value.upper(),
-                                                slot.template[:40] + "..." if slot.template else "",
-                                                f"Region: {slot.region}" if slot.region else "",
-                                                display_logs,
-                                                slot.progress_percent,
-                                                slot.progress_message
+                                                status,
+                                                template,
+                                                info,
+                                                logs,
+                                                progress,
+                                                progress_msg
                                             )
                                     except Exception as e:
                                         logger.debug(f"Batch update error: {e}")
                                 
-                                # Use after_idle instead of after(0) to reduce priority
-                                self.workflow.frame.after_idle(batch_update)
+                                self._run_on_ui_thread(batch_update)
                         
                         time.sleep(update_interval)  # Sleep longer to reduce CPU usage
                     except Exception as e:
@@ -913,7 +966,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
         def update():
             self._update_gen_slot_display_direct(slot_id, status, template, info, logs, progress, progress_msg)
         
-        self.workflow.frame.after(0, update)
+        self._run_on_ui_thread(update)
     
     def _update_gen_slot_display_direct(self, slot_id: int, status: str, template: str, info: str, logs: List[str], progress: float = 0.0, progress_msg: str = ""):
         """Update generation slot display widget directly (no frame.after nesting) - OPTIMIZED for performance"""
@@ -968,7 +1021,7 @@ Generate a valid FASTEXPR expression that uses operator(data_field, parameters) 
         def update():
             self._update_gen_slot_progress_direct(slot_id, percent, message, api_status)
         
-        self.workflow.frame.after(0, update)
+        self._run_on_ui_thread(update)
     
     def _update_gen_slot_progress_direct(self, slot_id: int, percent: float, message: str, api_status: str):
         """Update generation slot progress bar and message directly (no frame.after nesting) - OPTIMIZED for performance"""

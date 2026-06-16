@@ -17,6 +17,7 @@ generated_modules/
 
 # VSCode
 .vscode/
+.DS_Store
 
 credential.txt
 
@@ -53,6 +54,9 @@ refly-main/
 *.db-shm
 *.db-wal
 generation_two_backtests.db*
+
+# Runtime state
+*.pid
 
 # Build artifacts
 dist/

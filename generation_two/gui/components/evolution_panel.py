@@ -5,6 +5,8 @@ Control self-evolution cycles
 
 import tkinter as tk
 import threading
+import queue
+from queue import Empty
 from tkinter import ttk, scrolledtext
 from typing import Optional, Callable
 
@@ -27,8 +29,46 @@ class EvolutionPanel:
         
         self.frame = tk.Frame(parent, **STYLES['frame'])
         self.frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue = queue.Queue()
+        self._ui_queue_pump_active = False
         
         self._create_widgets()
+        self._start_ui_queue_pump()
+
+    def _start_ui_queue_pump(self):
+        if self._ui_queue_pump_active:
+            return
+
+        self._ui_queue_pump_active = True
+        try:
+            self.frame.after(100, self._drain_ui_queue)
+        except tk.TclError:
+            self._ui_queue_pump_active = False
+
+    def _drain_ui_queue(self):
+        try:
+            for _ in range(100):
+                try:
+                    callback = self._ui_queue.get_nowait()
+                except Empty:
+                    break
+                callback()
+        finally:
+            if self._ui_queue_pump_active:
+                try:
+                    if self.frame.winfo_exists():
+                        self.frame.after(100, self._drain_ui_queue)
+                    else:
+                        self._ui_queue_pump_active = False
+                except tk.TclError:
+                    self._ui_queue_pump_active = False
+
+    def _run_on_ui_thread(self, callback):
+        if threading.get_ident() == self._main_thread_id:
+            callback()
+        else:
+            self._ui_queue.put(callback)
     
     def _create_widgets(self):
         """Create evolution control widgets"""
@@ -192,7 +232,7 @@ class EvolutionPanel:
         except Exception as e:
             error = e
 
-        self.frame.after(0, lambda: self._finish_evolution(result, error))
+        self._run_on_ui_thread(lambda: self._finish_evolution(result, error))
 
     def _finish_evolution(self, result, error):
         """Update UI after an evolution worker completes."""
@@ -215,10 +255,7 @@ class EvolutionPanel:
             self.log_text.insert(tk.END, message)
             self.log_text.see(tk.END)
 
-        if threading.current_thread() is threading.main_thread():
-            update()
-        else:
-            self.frame.after(0, update)
+        self._run_on_ui_thread(update)
 
     def _stop_evolution(self):
         """Stop evolution"""

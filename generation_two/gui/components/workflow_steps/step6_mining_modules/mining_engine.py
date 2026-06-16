@@ -4,13 +4,18 @@ Core mining logic with self-sustaining operation
 """
 
 import logging
+import json
 import time
 import threading
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 from generation_two.core.mining import MiningCoordinator, SearchStrategy
 from generation_two.core.slot_manager import SlotManager, SlotStatus
 from generation_two.core.simulator_tester import SimulatorTester, SimulationSettings
-from generation_two.core.region_config import REGION_DEFAULT_UNIVERSE, REGION_DEFAULT_NEUTRALIZATION
+from generation_two.core.region_config import (
+    REGION_DEFAULT_UNIVERSE,
+    REGION_DEFAULT_NEUTRALIZATION,
+    REGION_NEUTRALIZATIONS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,23 @@ class MiningEngine:
         self.operation_start_time = time.time()
         self.templates_generated_count = 0
         self.simulations_completed_count = 0
+        self.robustness_max_tests_per_alpha = 6
+        self.robustness_truncations = [0.08, 0.05, 0.03, 0.01]
+        self.robustness_decays = [0, 3, 5]
+        self.robustness_neutralization_preferences = [
+            'INDUSTRY',
+            'SUBINDUSTRY',
+            'SECTOR',
+            'STATISTICAL',
+            'CROWDING',
+        ]
+        self.improvement_max_variants_per_alpha = 1
+        self.improvement_strong_sharpe = 1.10
+        self.improvement_strong_fitness = 0.70
+        self.improvement_balanced_sharpe = 1.00
+        self.improvement_balanced_fitness = 0.80
+        self.improvement_repairable_sharpe = 0.95
+        self.improvement_repairable_fitness = 0.75
 
     @staticmethod
     def _format_metric(value, precision: int = 2) -> str:
@@ -131,6 +153,608 @@ class MiningEngine:
             logger.debug(f"Mining pre-submit operator normalization skipped: {e}")
 
         return template
+
+    def _parse_result_tags(self, result) -> List[str]:
+        """Parse JSON tags stored on a simulation result."""
+        tags_raw = getattr(result, 'tags', '') or ''
+        if not tags_raw:
+            return []
+        try:
+            tags = json.loads(tags_raw)
+            if isinstance(tags, list):
+                return [str(tag) for tag in tags]
+        except (TypeError, ValueError):
+            logger.debug(f"Could not parse result tags: {tags_raw}")
+        return []
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        """Convert optional metric values to float."""
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_result_checks(self, result) -> List:
+        """Parse JSON checks stored on a simulation result."""
+        checks_raw = getattr(result, 'checks', '') or ''
+        if not checks_raw:
+            return []
+        try:
+            checks = json.loads(checks_raw)
+            return checks if isinstance(checks, list) else []
+        except (TypeError, ValueError):
+            logger.debug(f"Could not parse result checks: {checks_raw[:120]}")
+        return []
+
+    def _should_run_robustness_sweep(self, result) -> bool:
+        """Run robustness only for candidates and promising near-misses."""
+        if not result:
+            return False
+
+        tags = set(self._parse_result_tags(result))
+        if 'robustness' in tags:
+            return False
+        if result.success or 'candidate' in tags:
+            return True
+        return 'near-miss' in tags and 'promising' in tags
+
+    def _settings_key(self, settings: SimulationSettings) -> tuple:
+        """Deduplicate robustness settings."""
+        return (
+            settings.neutralization,
+            settings.truncation,
+            settings.decay,
+            settings.delay,
+            settings.testPeriod,
+        )
+
+    def _build_robustness_settings(
+        self,
+        region: str,
+        base_settings: SimulationSettings
+    ) -> List[SimulationSettings]:
+        """Build a small, budgeted settings grid around a promising alpha."""
+        supported_neutralizations = REGION_NEUTRALIZATIONS.get(region, ['INDUSTRY'])
+        neutralizations = []
+        for neutralization in [base_settings.neutralization] + self.robustness_neutralization_preferences:
+            if neutralization in supported_neutralizations and neutralization not in neutralizations:
+                neutralizations.append(neutralization)
+
+        candidates = []
+        seen = {self._settings_key(base_settings)}
+
+        # First vary one dimension at a time around the initial successful setting.
+        for truncation in self.robustness_truncations:
+            settings = SimulationSettings(
+                region=region,
+                universe=base_settings.universe,
+                neutralization=base_settings.neutralization,
+                truncation=truncation,
+                decay=base_settings.decay,
+                delay=base_settings.delay,
+                testPeriod=base_settings.testPeriod
+            )
+            key = self._settings_key(settings)
+            if key not in seen:
+                candidates.append(settings)
+                seen.add(key)
+
+        for decay in self.robustness_decays:
+            settings = SimulationSettings(
+                region=region,
+                universe=base_settings.universe,
+                neutralization=base_settings.neutralization,
+                truncation=base_settings.truncation,
+                decay=decay,
+                delay=base_settings.delay,
+                testPeriod=base_settings.testPeriod
+            )
+            key = self._settings_key(settings)
+            if key not in seen:
+                candidates.append(settings)
+                seen.add(key)
+
+        for neutralization in neutralizations:
+            settings = SimulationSettings(
+                region=region,
+                universe=base_settings.universe,
+                neutralization=neutralization,
+                truncation=base_settings.truncation,
+                decay=base_settings.decay,
+                delay=base_settings.delay,
+                testPeriod=base_settings.testPeriod
+            )
+            key = self._settings_key(settings)
+            if key not in seen:
+                candidates.append(settings)
+                seen.add(key)
+
+        # Then add a few conservative combinations if budget remains.
+        for truncation in self.robustness_truncations[1:]:
+            for decay in self.robustness_decays[1:]:
+                settings = SimulationSettings(
+                    region=region,
+                    universe=base_settings.universe,
+                    neutralization=base_settings.neutralization,
+                    truncation=truncation,
+                    decay=decay,
+                    delay=base_settings.delay,
+                    testPeriod=base_settings.testPeriod
+                )
+                key = self._settings_key(settings)
+                if key not in seen:
+                    candidates.append(settings)
+                    seen.add(key)
+                if len(candidates) >= self.robustness_max_tests_per_alpha:
+                    return candidates[:self.robustness_max_tests_per_alpha]
+
+        return candidates[:self.robustness_max_tests_per_alpha]
+
+    def _mark_robustness_result(self, result):
+        """Add robustness tags to a result before persistence."""
+        tags = self._parse_result_tags(result)
+        for tag in ['robustness', 'candidate-robust' if result.success else 'robustness-failed']:
+            if tag not in tags:
+                tags.append(tag)
+        result.tags = json.dumps(tags)
+        return result
+
+    def _should_refeed_error(self, error_message: str) -> bool:
+        """Only refeed errors that can plausibly be fixed by editing syntax."""
+        message = (error_message or "").lower()
+        if not message:
+            return False
+
+        structural_keywords = [
+            'syntax',
+            'parse',
+            'parser',
+            'compile',
+            'compiler',
+            'unbalanced',
+            'parentheses',
+            'unknown variable',
+            'undefined variable',
+            'invalid field',
+            'field not found',
+            'unknown field',
+            'type error',
+            'type mismatch',
+            'incompatible',
+            'operator',
+            'operand',
+            'placeholder',
+            'data_field',
+            'does not support event inputs',
+            'local validation failed',
+            'submit failed',
+        ]
+        if any(keyword in message for keyword in structural_keywords):
+            return True
+
+        # IS check failures such as LOW_SHARPE or CONCENTRATED_WEIGHT are
+        # outcome problems, not expression-structure problems. Refeeding them
+        # as syntax fixes burns LLM calls and simulation budget.
+        if message.startswith('failed checks:') or message.startswith('warning checks:'):
+            return False
+
+        outcome_keywords = [
+            'low_sharpe',
+            'low_fitness',
+            'low_turnover',
+            'high_turnover',
+            'concentrated_weight',
+            'sub_universe',
+            'self_correlation',
+            'matches_competition',
+            'ladder',
+        ]
+        if any(keyword in message for keyword in outcome_keywords):
+            return False
+
+        return False
+
+    def _should_run_improvement_attempt(self, result) -> bool:
+        """Use LLM improvement only for near-misses with enough signal to be worth one more test."""
+        if not result or result.success:
+            return False
+
+        tags = set(self._parse_result_tags(result))
+        if 'improved' in tags or 'robustness' in tags:
+            return False
+        if 'near-miss' not in tags:
+            return False
+
+        sharpe = self._safe_float(getattr(result, 'sharpe', 0.0))
+        fitness = self._safe_float(getattr(result, 'fitness', 0.0))
+        repairable_tags = {'concentration', 'subuniverse', 'turnover', 'high-turnover'}
+
+        if sharpe >= self.improvement_strong_sharpe and fitness >= self.improvement_strong_fitness:
+            return True
+        if sharpe >= self.improvement_balanced_sharpe and fitness >= self.improvement_balanced_fitness:
+            return True
+        if (
+            tags.intersection(repairable_tags)
+            and sharpe >= self.improvement_repairable_sharpe
+            and fitness >= self.improvement_repairable_fitness
+        ):
+            return True
+
+        return False
+
+    def _get_available_operator_names(self) -> List[str]:
+        """Return operator names available to the template generator."""
+        if not self.generator or not self.generator.template_generator:
+            return []
+        operator_fetcher = getattr(self.generator.template_generator, 'operator_fetcher', None)
+        operators = getattr(operator_fetcher, 'operators', None) if operator_fetcher else None
+        try:
+            from generation_two.core.selection_safety import filter_generation_operators
+            operators = filter_generation_operators(operators)
+        except Exception as e:
+            logger.debug(f"Operator safety filtering skipped for improve prompt: {e}")
+        names = []
+        for operator in operators or []:
+            if isinstance(operator, dict) and operator.get('name'):
+                names.append(str(operator['name']))
+            elif isinstance(operator, str):
+                names.append(operator)
+        return names
+
+    def _get_available_field_ids(self, region: str) -> List[str]:
+        """Return field IDs available to the template generator for a region."""
+        if not self.generator or not self.generator.template_generator:
+            return []
+        fields = self.generator.template_generator.get_data_fields_for_region(region)
+        field_ids = []
+        for field in fields or []:
+            if isinstance(field, dict):
+                field_id = field.get('id') or field.get('name')
+                if field_id:
+                    field_ids.append(str(field_id))
+            elif isinstance(field, str):
+                field_ids.append(field)
+        return field_ids
+
+    def _extract_llm_expression(self, response: str) -> str:
+        """Extract a FASTEXPR expression from an LLM response."""
+        validator = None
+        if self.generator and self.generator.template_generator:
+            validator = getattr(self.generator.template_generator, 'template_validator', None)
+        if validator and hasattr(validator, '_extract_expression_from_response'):
+            return validator._extract_expression_from_response(response)
+
+        if not response:
+            return ""
+        response = response.strip().strip('`').strip('"\'')
+        lines = [line.strip().strip('`').strip('"\'') for line in response.splitlines() if line.strip()]
+        candidates = [line.rstrip('.,;') for line in lines if '(' in line and ')' in line]
+        return max(candidates, key=len) if candidates else (lines[0] if lines else "")
+
+    def _build_improvement_prompt(
+        self,
+        result,
+        region: str,
+        settings: SimulationSettings,
+        available_operators: List[str],
+        available_fields: List[str]
+    ) -> str:
+        """Build a performance-oriented alpha improvement prompt."""
+        tags = self._parse_result_tags(result)
+        checks = self._parse_result_checks(result)
+        failed_checks = []
+        pending_checks = []
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            name = str(check.get('name') or check.get('title') or check.get('type') or 'check')
+            state = str(check.get('result') or check.get('status') or check.get('severity') or '').upper()
+            value = check.get('value')
+            limit = check.get('limit')
+            entry = f"{name}={state}"
+            if value is not None:
+                entry += f" value={value}"
+            if limit is not None:
+                entry += f" limit={limit}"
+            if state in {'FAIL', 'FAILED', 'ERROR', 'WARNING', 'WARN'}:
+                failed_checks.append(entry)
+            elif state == 'PENDING':
+                pending_checks.append(entry)
+
+        guidance = []
+        tags_set = set(tags)
+        if 'concentration' in tags_set:
+            guidance.append("Reduce concentrated weights by keeping the signal continuous: prefer rank/normalize/winsorize/zscore and avoid sign/sqrt-style discretization or compression.")
+        if 'subuniverse' in tags_set:
+            guidance.append("Improve sub-universe robustness by using broader, smoother signals and avoiding fragile single-field spikes.")
+        if 'turnover' in tags_set or 'high-turnover' in tags_set:
+            guidance.append("Reduce turnover by adding smoothing/time-series aggregation or less reactive transforms.")
+        if 'sharpe' in tags_set or 'fitness' in tags_set:
+            guidance.append("Improve risk-adjusted signal quality by denoising, changing direction when sensible, and combining one complementary transform.")
+        if not guidance:
+            guidance.append("Make one or two small economically plausible changes that improve robustness without inventing unavailable fields.")
+
+        return f"""You are improving a WorldQuant Brain FASTEXPR alpha expression.
+
+Goal: return ONE improved FASTEXPR expression that can be submitted directly.
+
+Original expression:
+{result.template}
+
+Region: {region}
+Settings: universe={settings.universe}, delay={settings.delay}, neutralization={settings.neutralization}, decay={settings.decay}, truncation={settings.truncation}
+
+Current metrics:
+Sharpe={self._format_metric(getattr(result, 'sharpe', None), 4)}
+Fitness={self._format_metric(getattr(result, 'fitness', None), 4)}
+Turnover={self._format_metric(getattr(result, 'turnover', None), 4)}
+Returns={self._format_metric(getattr(result, 'returns', None), 4)}
+Drawdown={self._format_metric(getattr(result, 'drawdown', None), 4)}
+Margin={self._format_metric(getattr(result, 'margin', None), 6)}
+
+Failed or warning checks:
+{chr(10).join(failed_checks) if failed_checks else 'None'}
+
+Pending checks:
+{chr(10).join(pending_checks) if pending_checks else 'None'}
+
+Tags:
+{', '.join(tags) if tags else 'none'}
+
+Improvement priorities:
+{chr(10).join('- ' + item for item in guidance)}
+
+Constraints:
+- Return ONLY the improved FASTEXPR expression.
+- Do not explain, do not return markdown, do not return JSON.
+- Preserve the core economic idea, but change one or two expression-level details.
+- Prefer simple robust transforms such as rank, zscore, winsorize, normalize, ts_mean, ts_rank, reverse, subtract, add, and divide when appropriate.
+- Avoid adding sign or sqrt unless the original expression already uses it and removing it would clearly break the core idea.
+- Use only operators from this available list when possible: {', '.join(available_operators[:80])}
+- Use exact available field IDs; prefer reusing original fields unless replacing a weak field is necessary.
+- Available fields sample: {', '.join(available_fields[:80])}
+- Do not use placeholders like DATA_FIELD1 or OPERATOR1.
+- Make the expression syntactically valid FASTEXPR with balanced parentheses.
+
+Improved FASTEXPR expression:"""
+
+    def _generate_improved_template(self, result, region: str, settings: SimulationSettings) -> str:
+        """Ask the configured LLM for one performance-improved expression."""
+        if not self.generator or not self.generator.template_generator:
+            return ""
+
+        ollama_manager = getattr(self.generator.template_generator, 'ollama_manager', None)
+        if not ollama_manager:
+            return ""
+
+        available_operators = self._get_available_operator_names()
+        available_fields = self._get_available_field_ids(region)
+        prompt = self._build_improvement_prompt(
+            result=result,
+            region=region,
+            settings=settings,
+            available_operators=available_operators,
+            available_fields=available_fields
+        )
+
+        response = ollama_manager.generate(
+            prompt,
+            temperature=0.35,
+            max_tokens=700,
+            progress_callback=None
+        )
+        improved_template = self._extract_llm_expression(response or "")
+        if not improved_template:
+            return ""
+
+        improved_template = self._normalize_before_submit(improved_template)
+        if improved_template.strip() == (result.template or "").strip():
+            logger.info("LLM improvement returned the original expression; skipping")
+            return ""
+
+        return improved_template
+
+    def _mark_improvement_result(self, result, source_result):
+        """Add improvement tags to a simulation result."""
+        tags = self._parse_result_tags(result)
+        for tag in [
+            'improved',
+            'improved-from-near-miss' if not getattr(source_result, 'success', False) else 'improved-from-candidate',
+            'improved-candidate' if result.success else 'improved-failed',
+        ]:
+            if tag not in tags:
+                tags.append(tag)
+        result.tags = json.dumps(tags)
+        return result
+
+    def _run_improvement_attempt(
+        self,
+        slot_id: int,
+        source_result,
+        region: str,
+        settings: SimulationSettings
+    ):
+        """Run one LLM-driven expression improvement attempt for a promising near-miss."""
+        if not self._should_run_improvement_attempt(source_result):
+            return None
+        if not self.sim_counter.can_simulate():
+            self._log("⚠️ Daily simulation limit reached before improvement attempt")
+            return None
+
+        slot = self.slot_manager.get_slot_status(slot_id)
+        if slot:
+            slot.add_log("🧠 LLM improve: generating expression variant")
+        self._log(f"🧠 {region}: LLM improve queued for near-miss alpha")
+
+        improved_template = self._generate_improved_template(source_result, region, settings)
+        if not improved_template:
+            if slot:
+                slot.add_log("🧠 LLM improve skipped: no usable expression returned")
+            return None
+
+        import re
+        remaining_ops = re.findall(r'\b(OPERATOR\d+|operator\d+|Operator\d+)\b', improved_template, re.IGNORECASE)
+        remaining_fields = re.findall(r'\b(DATA_FIELD\d+|data_field\d+|Data_Field\d+)\b', improved_template, re.IGNORECASE)
+        if remaining_ops or remaining_fields:
+            if slot:
+                slot.add_log(f"🧠 LLM improve skipped: placeholders remain {remaining_ops + remaining_fields}")
+            return None
+
+        if self.backtest_storage and self.backtest_storage.has_been_simulated(improved_template, region):
+            if slot:
+                slot.add_log("🧠 LLM improve skipped: expression was already simulated")
+            return None
+
+        local_validation = self._validate_before_submit(improved_template, region)
+        if local_validation and not local_validation.is_valid:
+            error_msg = local_validation.summary()
+            if slot:
+                slot.add_log(f"🧠 LLM improve skipped: local validation failed: {error_msg[:80]}")
+            logger.info("LLM improved expression failed local validation: %s", error_msg)
+            return None
+
+        status = self.sim_counter.increment_count()
+        if not status['can_simulate']:
+            self._log("⚠️ Daily simulation limit reached before improvement submit")
+            return None
+
+        if slot:
+            slot.add_log(f"🧠 LLM improve submit: {improved_template[:100]}...")
+        self._update_slot(slot_id, improved_template, region, 10, "Submitting LLM improvement...")
+
+        submission = self.simulator_tester.submit_simulation(improved_template, region, settings)
+        if not submission:
+            submit_error = submission.error_message or "Failed to submit LLM improvement"
+            if slot:
+                slot.add_log(f"❌ LLM improve submit failed: {submit_error[:80]}")
+            self._log(f"❌ {region}: LLM improve submit failed: {submit_error[:100]}")
+            return None
+
+        def progress_callback(percent, message, api_status):
+            self.slot_manager.update_slot_progress(slot_id, percent=percent, message=message, api_status=api_status)
+            active_slot = self.slot_manager.get_slot_status(slot_id)
+            if active_slot:
+                active_slot.add_log(f"[IMPROVE {api_status}] {message}")
+            self._update_slot(slot_id, improved_template, region, percent, f"LLM improve: {message}")
+
+        try:
+            result = self.simulator_tester.monitor_simulation(
+                submission.progress_url,
+                improved_template,
+                region,
+                settings,
+                progress_callback=progress_callback
+            )
+        finally:
+            self.simulator_tester.release_simulation_slot(submission)
+
+        if not result:
+            return None
+
+        result = self._mark_improvement_result(result, source_result)
+        if self.backtest_storage:
+            self.backtest_storage.store_result(result)
+
+        if result.success and result.alpha_id:
+            self.correlation_tracker.update_template_alpha_mapping(improved_template, str(result.alpha_id))
+            self.search_strategy.add_successful_template(improved_template, region)
+
+        outcome = "PASS" if result.success else "FAIL"
+        self._log(
+            f"🧠 {region}: LLM improve {outcome} "
+            f"Sharpe={self._format_metric(result.sharpe)}, Fitness={self._format_metric(result.fitness)}"
+        )
+        return result
+
+    def _run_robustness_sweep(
+        self,
+        slot_id: int,
+        template: str,
+        region: str,
+        base_settings: SimulationSettings,
+        base_result
+    ) -> List:
+        """Run a budgeted robustness sweep for a promising alpha."""
+        if not self._should_run_robustness_sweep(base_result):
+            return []
+
+        settings_grid = self._build_robustness_settings(region, base_settings)
+        if not settings_grid:
+            return []
+
+        slot = self.slot_manager.get_slot_status(slot_id)
+        if slot:
+            slot.add_log(f"🧪 Robustness sweep: {len(settings_grid)} settings")
+        self._log(f"🧪 {region}: Robustness sweep queued ({len(settings_grid)} tests)")
+
+        results = []
+        for idx, settings in enumerate(settings_grid, start=1):
+            if self.stop_flag:
+                break
+            if not self.sim_counter.can_simulate():
+                self._log("⚠️ Daily simulation limit reached during robustness sweep")
+                break
+
+            status = self.sim_counter.increment_count()
+            if not status['can_simulate']:
+                self._log("⚠️ Daily simulation limit reached during robustness sweep")
+                break
+
+            slot = self.slot_manager.get_slot_status(slot_id)
+            if slot:
+                slot.add_log(
+                    f"🧪 Robustness {idx}/{len(settings_grid)}: "
+                    f"trunc={settings.truncation}, decay={settings.decay}, neut={settings.neutralization}"
+                )
+
+            submission = self.simulator_tester.submit_simulation(template, region, settings)
+            if not submission:
+                submit_error = submission.error_message or "Failed to submit robustness test"
+                if slot:
+                    slot.add_log(f"❌ Robustness submit failed: {submit_error[:80]}")
+                continue
+
+            def progress_callback(percent, message, api_status):
+                self.slot_manager.update_slot_progress(slot_id, percent=percent, message=message, api_status=api_status)
+                active_slot = self.slot_manager.get_slot_status(slot_id)
+                if active_slot:
+                    active_slot.add_log(f"[ROBUST {api_status}] {message}")
+                self._update_slot(slot_id, template, region, percent, f"Robustness {idx}/{len(settings_grid)}")
+
+            try:
+                result = self.simulator_tester.monitor_simulation(
+                    submission.progress_url,
+                    template,
+                    region,
+                    settings,
+                    progress_callback=progress_callback
+                )
+            finally:
+                self.simulator_tester.release_simulation_slot(submission)
+
+            if result:
+                result = self._mark_robustness_result(result)
+                results.append(result)
+                if self.backtest_storage:
+                    self.backtest_storage.store_result(result)
+
+                if result.success and result.alpha_id:
+                    self.correlation_tracker.update_template_alpha_mapping(template, str(result.alpha_id))
+                    self.search_strategy.add_successful_template(template, region)
+
+                sharpe = self._format_metric(result.sharpe)
+                fitness = self._format_metric(result.fitness)
+                outcome = "PASS" if result.success else "FAIL"
+                self._log(
+                    f"🧪 {region}: Robustness {outcome} "
+                    f"trunc={settings.truncation}, decay={settings.decay}, "
+                    f"neut={settings.neutralization}, Sharpe={sharpe}, Fitness={fitness}"
+                )
+
+        return results
     
     def start(self):
         """Start mining engine"""
@@ -206,9 +830,12 @@ class MiningEngine:
             
             # Use algorithmic generation (like Step 4) - generates placeholders
             from generation_two.core.algorithmic_template_generator import AlgorithmicTemplateGenerator
+            from generation_two.core.selection_safety import filter_generation_fields, filter_generation_operators
             
-            available_operators = self.generator.template_generator.operator_fetcher.operators if self.generator.template_generator.operator_fetcher else None
-            available_fields = self.generator.template_generator.get_data_fields_for_region(region)
+            raw_operators = self.generator.template_generator.operator_fetcher.operators if self.generator.template_generator.operator_fetcher else None
+            raw_fields = self.generator.template_generator.get_data_fields_for_region(region)
+            available_operators = filter_generation_operators(raw_operators)
+            available_fields = filter_generation_fields(raw_fields)
             
             if not available_operators or not available_fields:
                 logger.warning(f"No operators or fields available for {region}")
@@ -638,7 +1265,22 @@ class MiningEngine:
             
             # Handle refeed if failed
             if result and not result.success:
-                result = self._handle_refeed(slot_id, template, region, result.error_message, settings)
+                original_result = result
+                if self._should_refeed_error(result.error_message):
+                    refed_result = self._handle_refeed(slot_id, template, region, result.error_message, settings)
+                    if refed_result is not None:
+                        result = refed_result
+                    else:
+                        result = original_result
+                else:
+                    slot = self.slot_manager.get_slot_status(slot_id)
+                    if slot:
+                        slot.add_log("⏭ Skipping refeed for IS performance/check failure")
+                    logger.info(
+                        "Skipping refeed for non-structural failure in %s: %s",
+                        region,
+                        (result.error_message or "Unknown error")[:160],
+                    )
             
             # Check if result is None (simulation failed completely)
             if result is None:
@@ -650,6 +1292,26 @@ class MiningEngine:
             # Save result
             if self.backtest_storage:
                 self.backtest_storage.store_result(result)
+
+            improved_result = self._run_improvement_attempt(
+                slot_id=slot_id,
+                source_result=result,
+                region=region,
+                settings=settings
+            )
+            robustness_base_result = improved_result if improved_result and (
+                improved_result.success
+                or self._safe_float(getattr(improved_result, 'sharpe', 0.0)) >= self._safe_float(getattr(result, 'sharpe', 0.0))
+                or self._safe_float(getattr(improved_result, 'fitness', 0.0)) >= self._safe_float(getattr(result, 'fitness', 0.0))
+            ) else result
+
+            self._run_robustness_sweep(
+                slot_id=slot_id,
+                template=robustness_base_result.template if getattr(robustness_base_result, 'template', None) else template,
+                region=region,
+                base_settings=settings,
+                base_result=robustness_base_result
+            )
             
             # Update correlation tracker
             if result.success and result.alpha_id:

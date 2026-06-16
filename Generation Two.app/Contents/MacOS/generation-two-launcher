@@ -1,0 +1,8 @@
+#!/bin/zsh
+set -e
+
+PROJECT_DIR="/Users/volcano/code/worldquant-miner/generation_two"
+LOG_FILE="$PROJECT_DIR/generation_two_gui.log"
+
+cd "$PROJECT_DIR"
+exec "$PROJECT_DIR/.venv/bin/python" -u gui/run_gui.py ../credential.txt >> "$LOG_FILE" 2>&1

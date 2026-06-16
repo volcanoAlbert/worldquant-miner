@@ -138,14 +138,14 @@ class Step6Mining:
         """Update simulation counter display"""
         if hasattr(self, 'sim_counter') and self.sim_counter:
             status = self.sim_counter.get_status()
-            self.workflow.frame.after(0, lambda: self.ui.sim_counter_label.config(
+            self.workflow.run_on_ui_thread(lambda: self.ui.sim_counter_label.config(
                 text=f"Today's Simulations: {status['count']} / {status['limit']} (EST) - "
                      f"{status['remaining']} remaining"
             ))
     
     def _update_mining_slot_display(self, slot_id, status, template, region_info, progress, message, logs=None):
         """Update mining slot display - delegates to UI module"""
-        self.workflow.frame.after(0, lambda: self.ui.update_slot_display(
+        self.workflow.run_on_ui_thread(lambda: self.ui.update_slot_display(
             slot_id, status, template, region_info, progress, message, logs
         ))
     
@@ -179,4 +179,4 @@ class Step6Mining:
     
     def _log_mining(self, message):
         """Log message to mining log"""
-        self.workflow.frame.after(0, lambda: self.ui.log_message(message))
+        self.workflow.run_on_ui_thread(lambda: self.ui.log_message(message))

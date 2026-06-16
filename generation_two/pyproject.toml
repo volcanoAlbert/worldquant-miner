@@ -25,7 +25,9 @@ classifiers = [
 
 dependencies = [
     "requests>=2.28.0",
-    "tkinter",  # Usually included with Python
+    "numpy>=1.21.0",
+    "PyYAML>=6.0",
+    "urllib3<2",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +41,24 @@ dev = [
 generation-two = "generation_two.gui.run_gui:main"
 
 [tool.setuptools]
-packages = ["generation_two"]
+package-dir = {"" = ".."}
+packages = [
+    "generation_two",
+    "generation_two.core",
+    "generation_two.core.config",
+    "generation_two.core.mining",
+    "generation_two.core.recorder",
+    "generation_two.core.utils",
+    "generation_two.data_fetcher",
+    "generation_two.evolution",
+    "generation_two.gui",
+    "generation_two.gui.components",
+    "generation_two.gui.components.workflow_steps",
+    "generation_two.gui.components.workflow_steps.step6_mining_modules",
+    "generation_two.ollama",
+    "generation_two.self_evolution",
+    "generation_two.storage",
+]
 
 [tool.setuptools.package-data]
 generation_two = [
